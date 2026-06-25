@@ -1,0 +1,67 @@
+# TreeLoc++ inter-session example configuration.
+
+mode: inter
+query_root: sample_data/oxford_v03
+database_root: sample_data/oxford_v02
+max_frames: 60
+
+spatial_threshold: 10.0
+recall_k: 1
+histogram_k: 100
+rerank_k: 10
+
+knn_k: 10
+min_dist: 2.0
+max_dist: 30.0
+delta_l: 0.1
+rho: 100007
+hash_modulus: 50000000
+
+number_of_cluster: 30
+local_radius: 30.0
+tree_score_min: 0.1
+neighbor_augment: true
+neighbor_past_only: false
+neighbor_max_scenes: 5
+neighbor_radius: 10.0
+min_reconstructed_per_frame: 15
+dedup_distance: 0.2
+
+min_radius: 0.0
+max_radius: 0.8
+total_section: 8
+bin_width: 0.15
+spatial_bin_interval: 6.0
+spatial_bin_padding: 1.0
+spatial_bin_count: 5
+spatial_bin_min: 0.0
+spatial_bin_max: 30.0
+
+tdh_use_rec_only: false
+pairwise_use_rec_only: true
+pairwise_weight: 0.8
+pairwise_min_dist: 0.0
+pairwise_max_dist: 10.0
+pairwise_bins: 40
+pairwise_max_pairs: 5000
+pairwise_soft_binning: true
+
+use_t_aware_overlap: true
+t_aware_mode: exp
+t_aware_tau: 10.0
+t_aware_power: 2.0
+
+use_yaw_voting: true
+yaw_bin_deg: 5.0
+yaw_inlier_tol_deg: 10.0
+yaw_min_tri_inliers: 2
+
+use_dbh_triangle_match: true
+dbh_diff_tol: 0.2
+match_distance_tol: 0.4
+
+use_vertical: true
+vertical_ransac_iters: 200
+vertical_min_sample: 4
+z_inlier_tol: 0.1
+z_inlier_ratio: 0.5

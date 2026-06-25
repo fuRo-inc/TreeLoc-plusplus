@@ -1,48 +1,67 @@
 <div align="center">
 
-<h1>TreeLoc: 6-DoF LiDAR Global Localization in Forests via Inter-Tree Geometric Matching</h1>
+<h1>TreeLoc++: Multi-Session Forest Localization with Tree Geometry</h1>
 
-📌 **[ICRA 2026]** Official repository for **TreeLoc**
+Official repository for **TreeLoc++**.
 
-📄 **[[Paper]](https://arxiv.org/abs/2602.01501)** | 🎥 **[[Video]](https://www.youtube.com/watch?v=1iiqoRSXjUE)**
-
-<a href="https://scholar.google.co.kr/citations?user=aKPTi7gAAAAJ&hl=ko" target="_blank">Minwoo Jung</a>, <a href="https://scholar.google.com/citations?user=ZKuNQGsAAAAJ&hl=en" target="_blank">Nived Chebrolu</a>, <a href="https://scholar.google.com/citations?user=J5pi31QAAAAJ&hl=pt-BR" target="_blank">Lucas Carvalho de Lima</a>, <a href="https://scholar.google.com/citations?user=ISDgG3MAAAAJ&hl=en" target="_blank">Haedam Oh</a>, <a href="https://scholar.google.com/citations?user=BqV8LaoAAAAJ&hl=en" target="_blank">Maurice Fallon</a>, <a href="https://scholar.google.com/citations?user=7yveufgAAAAJ&hl=ko" target="_blank">Ayoung Kim</a><sup>†</sup>
-
-🤝 Collaboration among **Seoul National University** and **University of Oxford**.
-<a href="https://www.youtube.com/watch?v=1iiqoRSXjUE" target="_blank">
-  <img src="https://github.com/user-attachments/assets/67d137c5-c8a9-4f29-98f9-f32a1fc27056" alt="TreeLoc teaser" width="900" />
-</a>
-
-</div>
+<a href="https://github.com/minwoo0611/TreeLoc" target="_blank">TreeLoc</a> | TreeLoc++
 
 </div>
 
 ### Recent Updates
-- [2026/03/28] We uploaded the full TreeLoc code.
-- [2026/02/12] Paper released on arXiv.
-- [2026/02/12] Initial release of the TreeLoc repository.
+- [2026/06/25] Initial TreeLoc++ branch with intra-session and inter-session C++ code.
 
 ### Contributions
-- **TreeLoc is a learning-free global localization framework for forests** that estimates accurate 6-DoF poses using compact tree-level representations.
-- **TreeLoc introduces a dual-descriptor pipeline** with TDH for coarse retrieval and a 2D triangle descriptor for fine verification.
-- **TreeLoc recovers 6-DoF poses directly from place recognition cues** using only tree geometry, axes, and base heights.
-- **TreeLoc achieves strong performance across diverse forest benchmarks** while enabling scalable long-term forest map management.
+- **TreeLoc++ extends TreeLoc to intra-session and inter-session forest localization** using TDH retrieval, pairwise tree-distance histograms, triangle verification, DBH-aware matching, and yaw-voting initialization.
+- **TreeLoc++ uses tree-level CSV files with `location_z` read directly from CSV when available**, so runtime localization does not require `terrain.obj` or `trajectory_tree.txt`.
+- **TreeLoc++ keeps parameters in YAML config files** for dataset paths, descriptor settings, neighbor augmentation, pairwise weighting, yaw voting, DBH gates, and vertical correction.
 
-### Data Source and Tree Extraction
+### Dataset
 
-TreeLoc uses tree-level representations extracted from forest LiDAR data. In this repository, the tree observations were prepared using [RealtimeTrees](https://github.com/ori-drs/realtime_trees), and the underlying forest recordings come from the [Oxford Forest Place Recognition Dataset](https://dynamic.robots.ox.ac.uk/datasets/oxford-forest/).
+Full dataset will be opened after finalaccpetance.
 
-The example dataset bundled with the current configuration is `oxford_single_evo/`, which follows the TreeLoc-ready format described below.
+This branch includes small public samples under `sample_data/`. The samples are generated from the Oxford V-02 and V-03 large-cluster traces and contain short sequences with `axis_*`, `location_x`, `location_y`, `location_z`, DBH, reconstruction, cluster, and score fields.
+
+The runtime dataset format is:
+
+```text
+dataset_root/
+├── trajectory.txt
+├── TreeManagerState_0.csv
+├── TreeManagerState_1.csv
+└── ...
+```
+
+`trajectory.txt` uses:
+
+```text
+timestamp x y z qx qy qz qw
+```
+
+Each `TreeManagerState_<idx>.csv` must include:
+
+- `axis_00` ... `axis_22`
+- `location_x`, `location_y`, `location_z`
+- `dbh` or `dbh_approximation`
+
+Optional columns used when available:
+
+- `reconstructed`
+- `number_clusters`
+- `score` or `scores`
+- `alignment_z`
+
+`tools/prepare_sample_data.py` copies TreeLoc-style CSV rows without `trajectory_tree.txt` normalization. If the source CSV already has `location_z`, the value is preserved. If `location_z` is missing, pass `--terrain` to fill tree heights from `terrain.obj` with 6-NN inverse-distance interpolation.
 
 ### Prerequisites
 
-TreeLoc has been tested as a C++17 project built with CMake.
+TreeLoc++ is a C++17 CMake project.
 
 - CMake >= 3.16
-- A C++17 compiler with OpenMP support
+- C++17 compiler
 - Eigen3
 
-On Ubuntu, the required packages can be installed with:
+Ubuntu:
 
 ```bash
 sudo apt update
@@ -58,81 +77,76 @@ cmake --build build -j
 
 This builds:
 
-- `tree_localization_main`: TreeLoc localization executable
-
-### Input Format
-
-The runtime dataset root should contain:
-
-```text
-dataset_root/
-├── trajectory.txt
-├── TreeManagerState_0.csv
-├── TreeManagerState_1.csv
-├── TreeManagerState_2.csv
-└── ...
-```
-
-`trajectory.txt` must contain one pose per line in the format:
-
-```text
-timestamp x y z qx qy qz qw
-```
-
-The tree-level representations used by TreeLoc were extracted with [RealtimeTrees](https://github.com/ori-drs/realtime_trees). Each `TreeManagerState_<idx>.csv` file is expected to contain tree-level information for the corresponding frame. The required columns are:
-
-- `axis_00` ... `axis_22`
-- `location_x`
-- `location_y`
-- `location_z`
-- `dbh` or `dbh_approximation`
-
-The following columns are also supported and used when available:
-
-- `reconstructed`
-- `number_clusters`
-- `score`
-
-The current parser reads CSV columns by header name, so column order does not need to be fixed as long as the required fields exist.
+- `treelocpp_intra`
+- `treelocpp_inter`
 
 ### Usage
 
-Run TreeLoc with the default configuration:
+Intra-session:
 
 ```bash
-./build/tree_localization_main
+./build/treelocpp_intra config/default.yaml
 ```
 
-Run TreeLoc with an explicit dataset path and config file:
+Inter-session:
 
 ```bash
-./build/tree_localization_main /path/to/dataset config/default.yaml
+./build/treelocpp_inter config/inter.yaml
 ```
 
-Run TreeLoc by passing only a config file:
+Regenerate the sample from a full local TreeLoc++ sequence:
 
 ```bash
-./build/tree_localization_main config/default.yaml
+python3 tools/prepare_sample_data.py \
+  --source /path/to/oxford/V-02_large_cluster \
+  --terrain /path/to/oxford/terrain.obj \
+  --output sample_data/oxford_v02 \
+  --frames 60
 ```
 
-### TODO
+The 60-frame samples are intended for build and runtime smoke tests. Intra-session metrics should be measured on a full sequence because a short slice may not contain positive pairs after temporal filtering.
 
-- [ ] Multi-session support
-- [ ] Multi-session dataset release
+Full intra-session evaluation should use the full sequence:
+
+```bash
+python3 tools/prepare_sample_data.py \
+  --source /path/to/oxford/V-02_large_cluster \
+  --terrain /path/to/oxford/terrain.obj \
+  --output data/oxford_v02_intra
+
+./build/treelocpp_intra config/full_v02.yaml
+```
+
+Full inter-session evaluation uses Oxford V-03 as query and Oxford V-02 as map:
+
+```bash
+python3 tools/prepare_sample_data.py \
+  --source /path/to/oxford/V-02_large_cluster \
+  --terrain /path/to/oxford/terrain.obj \
+  --output data/oxford_v02
+
+python3 tools/prepare_sample_data.py \
+  --source /path/to/oxford/V-03_large_cluster \
+  --terrain /path/to/oxford/terrain.obj \
+  --output data/oxford_v03
+
+./build/treelocpp_inter config/inter_v02_v03.yaml
+```
+
+`config/inter_v02_v03.yaml` uses local TreeLoc-style axis alignment, V-region test polygons, and a 5 m ground-truth radius.
+
+### Configuration
+
+Main parameters are in:
+
+- `config/default.yaml` for intra-session evaluation
+- `config/inter.yaml` for inter-session evaluation
+- `config/full_v02.yaml` for full Oxford V-02 intra-session evaluation
+- `config/full_v03.yaml` for full Oxford V-03 intra-session evaluation
+- `config/inter_v02_v03.yaml` for full Oxford V-03-to-V-02 inter-session evaluation
+
+The defaults preserve the TreeLoc++ experiment settings used in the previous single-file implementation: TDH + pairwise retrieval, triangle hash reranking, DBH-aware triangle matching, yaw voting, neighbor augmentation, t-aware overlap, and z/roll/pitch correction from precomputed tree heights.
 
 ### Acknowledgement
 
-We thank the Oxford Dynamic Robot Systems Group for releasing the Oxford Forest dataset and the RealtimeTrees project that enabled tree-level data extraction for this work. This work was supported by the National Research Foundation of Korea (NRF) grant funded by the Korea government (MSIT) (No.RS-2024-00461409); the Technology Innovation Program (1415187329,20024355) funded by the Ministry of Trade, Industry & Energy (MOTIE,Korea); the Horizon Europe project DigiForest (101070405); and EPSRC Project Mobile Robotic Inspector (EP/Z531212/1) .
-
-If you use this repository, please cite:
-
-```bibtex
-@INPROCEEDINGS { mwjung-2026-icra,
-    AUTHOR = { Minwoo Jung and Nived Chebrolu and Lucas Carvalho de Lima and Haedam Oh and Maurice Fallon and Ayoung Kim },
-    TITLE = { TreeLoc: 6-DoF LiDAR Global Localization in Forests via Inter-Tree Geometric Matching },
-    BOOKTITLE = { Proceedings of the IEEE International Conference on Robotics and Automation (ICRA) },
-    YEAR = { 2026 },
-    MONTH = { June. },
-    ADDRESS = { Vienna },
-}
-```
+TreeLoc++ builds on TreeLoc and tree-level representations extracted with RealtimeTrees from forest LiDAR data.

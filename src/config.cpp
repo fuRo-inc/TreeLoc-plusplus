@@ -1,11 +1,14 @@
-#include "treeloc/config.h"
+#include "treelocpp/config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
-namespace treeloc {
+namespace treelocpp {
 
 namespace {
 
@@ -17,258 +20,194 @@ std::string Trim(const std::string& text) {
 }
 
 std::string StripComment(const std::string& line) {
-    bool in_single_quote = false;
-    bool in_double_quote = false;
+    bool single = false;
+    bool dbl = false;
     for (size_t i = 0; i < line.size(); ++i) {
-        if (line[i] == '\'' && !in_double_quote) {
-            in_single_quote = !in_single_quote;
-            continue;
-        }
-        if (line[i] == '"' && !in_single_quote) {
-            in_double_quote = !in_double_quote;
-            continue;
-        }
-        if (line[i] == '#' && !in_single_quote && !in_double_quote) {
-            return line.substr(0, i);
-        }
+        if (line[i] == '\'' && !dbl) single = !single;
+        if (line[i] == '"' && !single) dbl = !dbl;
+        if (line[i] == '#' && !single && !dbl) return line.substr(0, i);
     }
     return line;
 }
 
-int CountIndent(const std::string& line) {
-    int indent = 0;
-    while (indent < static_cast<int>(line.size()) && line[indent] == ' ') {
-        ++indent;
+std::string ParseString(const std::string& value) {
+    std::string out = Trim(value);
+    if (out.size() >= 2 &&
+        ((out.front() == '"' && out.back() == '"') ||
+         (out.front() == '\'' && out.back() == '\''))) {
+        out = out.substr(1, out.size() - 2);
     }
-    return indent;
+    return out;
 }
 
-template <typename NumberType>
-NumberType ParseNumber(const std::string& text,
-                       const std::string& field_name,
-                       size_t line_no) {
-    std::stringstream ss(text);
-    NumberType value;
-    ss >> value;
+std::string Lower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+
+template <typename T>
+T ParseNumber(const std::string& value, const std::string& key, size_t line_no) {
+    std::stringstream ss(value);
+    T parsed;
+    ss >> parsed;
     if (!ss || !ss.eof()) {
-        throw std::runtime_error("Invalid value for '" + field_name + "' on line " +
+        throw std::runtime_error("invalid value for " + key + " on line " +
                                  std::to_string(line_no));
     }
-    return value;
+    return parsed;
 }
 
-void AssignScalarField(const std::string& key,
-                       const std::string& value,
-                       Config& config,
-                       size_t line_no) {
-    auto parse_string = [](const std::string& text) {
-        const std::string trimmed = Trim(text);
-        if (trimmed.size() >= 2 &&
-            ((trimmed.front() == '"' && trimmed.back() == '"') ||
-             (trimmed.front() == '\'' && trimmed.back() == '\''))) {
-            return trimmed.substr(1, trimmed.size() - 2);
-        }
-        return trimmed;
-    };
+bool ParseBool(const std::string& value, const std::string& key, size_t line_no) {
+    const std::string v = Lower(ParseString(value));
+    if (v == "true" || v == "1" || v == "yes") return true;
+    if (v == "false" || v == "0" || v == "no") return false;
+    throw std::runtime_error("invalid boolean for " + key + " on line " +
+                             std::to_string(line_no));
+}
 
-    if (key == "dataset_root") {
-        config.dataset_root = parse_string(value);
-    } else if (key == "spatial_threshold") {
-        config.spatial_threshold = ParseNumber<double>(value, key, line_no);
-    } else if (key == "recall_k") {
-        config.recall_k = ParseNumber<int>(value, key, line_no);
-    } else if (key == "histogram_k") {
-        config.histogram_k = ParseNumber<int>(value, key, line_no);
-    } else if (key == "knn_k") {
-        config.knn_k = ParseNumber<int>(value, key, line_no);
-    } else if (key == "min_dist") {
-        config.min_dist = ParseNumber<double>(value, key, line_no);
-    } else if (key == "max_dist") {
-        config.max_dist = ParseNumber<double>(value, key, line_no);
-    } else if (key == "delta_l") {
-        config.delta_l = ParseNumber<double>(value, key, line_no);
-    } else if (key == "rho") {
-        config.rho = ParseNumber<long long>(value, key, line_no);
-    } else if (key == "hash_modulus") {
-        config.hash_modulus = ParseNumber<long long>(value, key, line_no);
-    } else if (key == "number_of_cluster") {
-        config.number_of_cluster = ParseNumber<int>(value, key, line_no);
-    } else if (key == "min_radius") {
-        config.min_radius = ParseNumber<double>(value, key, line_no);
-    } else if (key == "max_radius") {
-        config.max_radius = ParseNumber<double>(value, key, line_no);
-    } else if (key == "total_section") {
-        config.total_section = ParseNumber<int>(value, key, line_no);
-    } else if (key == "bin_width") {
-        config.bin_width = ParseNumber<double>(value, key, line_no);
-    } else if (key == "spatial_bin_interval") {
-        config.spatial_bin_interval = ParseNumber<double>(value, key, line_no);
-    } else if (key == "spatial_bin_padding") {
-        config.spatial_bin_padding = ParseNumber<double>(value, key, line_no);
-    } else if (key == "spatial_bin_count") {
-        config.spatial_bin_count = ParseNumber<int>(value, key, line_no);
-    } else if (key == "spatial_bin_min") {
-        config.spatial_bin_min = ParseNumber<double>(value, key, line_no);
-    } else if (key == "spatial_bin_max") {
-        config.spatial_bin_max = ParseNumber<double>(value, key, line_no);
-    } else {
-        throw std::runtime_error("Unknown config key '" + key + "' on line " +
-                                 std::to_string(line_no));
-    }
+void Assign(const std::string& key, const std::string& value, Config& config, size_t line_no) {
+    if (key == "mode") config.mode = ParseString(value);
+    else if (key == "dataset_root") config.dataset_root = ParseString(value);
+    else if (key == "query_root") config.query_root = ParseString(value);
+    else if (key == "database_root") config.database_root = ParseString(value);
+    else if (key == "max_frames") config.max_frames = ParseNumber<int>(value, key, line_no);
+    else if (key == "spatial_threshold") config.spatial_threshold = ParseNumber<double>(value, key, line_no);
+    else if (key == "use_test_polygons") config.use_test_polygons = ParseBool(value, key, line_no);
+    else if (key == "temporal_min_separation") config.temporal_min_separation = ParseNumber<int>(value, key, line_no);
+    else if (key == "recall_k") config.recall_k = ParseNumber<int>(value, key, line_no);
+    else if (key == "histogram_k") config.histogram_k = ParseNumber<int>(value, key, line_no);
+    else if (key == "rerank_k") config.rerank_k = ParseNumber<int>(value, key, line_no);
+    else if (key == "knn_k") config.knn_k = ParseNumber<int>(value, key, line_no);
+    else if (key == "min_dist") config.min_dist = ParseNumber<double>(value, key, line_no);
+    else if (key == "max_dist") config.max_dist = ParseNumber<double>(value, key, line_no);
+    else if (key == "delta_l") config.delta_l = ParseNumber<double>(value, key, line_no);
+    else if (key == "rho") config.rho = ParseNumber<long long>(value, key, line_no);
+    else if (key == "hash_modulus") config.hash_modulus = ParseNumber<long long>(value, key, line_no);
+    else if (key == "number_of_cluster") config.number_of_cluster = ParseNumber<int>(value, key, line_no);
+    else if (key == "local_radius") config.local_radius = ParseNumber<double>(value, key, line_no);
+    else if (key == "tree_score_min") config.tree_score_min = ParseNumber<double>(value, key, line_no);
+    else if (key == "neighbor_augment") config.neighbor_augment = ParseBool(value, key, line_no);
+    else if (key == "neighbor_past_only") config.neighbor_past_only = ParseBool(value, key, line_no);
+    else if (key == "neighbor_max_scenes") config.neighbor_max_scenes = ParseNumber<int>(value, key, line_no);
+    else if (key == "neighbor_radius") config.neighbor_radius = ParseNumber<double>(value, key, line_no);
+    else if (key == "min_reconstructed_per_frame") config.min_reconstructed_per_frame = ParseNumber<int>(value, key, line_no);
+    else if (key == "dedup_distance") config.dedup_distance = ParseNumber<double>(value, key, line_no);
+    else if (key == "apply_axis_alignment") config.apply_axis_alignment = ParseBool(value, key, line_no);
+    else if (key == "dataset_yaw_deg") config.dataset_yaw_deg = ParseNumber<double>(value, key, line_no);
+    else if (key == "query_yaw_deg") config.query_yaw_deg = ParseNumber<double>(value, key, line_no);
+    else if (key == "database_yaw_deg") config.database_yaw_deg = ParseNumber<double>(value, key, line_no);
+    else if (key == "min_radius") config.min_radius = ParseNumber<double>(value, key, line_no);
+    else if (key == "max_radius") config.max_radius = ParseNumber<double>(value, key, line_no);
+    else if (key == "total_section") config.total_section = ParseNumber<int>(value, key, line_no);
+    else if (key == "bin_width") config.bin_width = ParseNumber<double>(value, key, line_no);
+    else if (key == "spatial_bin_interval") config.spatial_bin_interval = ParseNumber<double>(value, key, line_no);
+    else if (key == "spatial_bin_padding") config.spatial_bin_padding = ParseNumber<double>(value, key, line_no);
+    else if (key == "spatial_bin_count") config.spatial_bin_count = ParseNumber<int>(value, key, line_no);
+    else if (key == "spatial_bin_min") config.spatial_bin_min = ParseNumber<double>(value, key, line_no);
+    else if (key == "spatial_bin_max") config.spatial_bin_max = ParseNumber<double>(value, key, line_no);
+    else if (key == "tdh_use_rec_only") config.tdh_use_rec_only = ParseBool(value, key, line_no);
+    else if (key == "pairwise_use_rec_only") config.pairwise_use_rec_only = ParseBool(value, key, line_no);
+    else if (key == "pairwise_weight") config.pairwise_weight = ParseNumber<double>(value, key, line_no);
+    else if (key == "pairwise_min_dist") config.pairwise_min_dist = ParseNumber<double>(value, key, line_no);
+    else if (key == "pairwise_max_dist") config.pairwise_max_dist = ParseNumber<double>(value, key, line_no);
+    else if (key == "pairwise_bins") config.pairwise_bins = ParseNumber<int>(value, key, line_no);
+    else if (key == "pairwise_max_pairs") config.pairwise_max_pairs = ParseNumber<int>(value, key, line_no);
+    else if (key == "pairwise_soft_binning") config.pairwise_soft_binning = ParseBool(value, key, line_no);
+    else if (key == "use_t_aware_overlap") config.use_t_aware_overlap = ParseBool(value, key, line_no);
+    else if (key == "t_aware_tau") config.t_aware_tau = ParseNumber<double>(value, key, line_no);
+    else if (key == "t_aware_power") config.t_aware_power = ParseNumber<double>(value, key, line_no);
+    else if (key == "t_aware_mode") config.t_aware_mode = ParseString(value);
+    else if (key == "use_yaw_voting") config.use_yaw_voting = ParseBool(value, key, line_no);
+    else if (key == "yaw_bin_deg") config.yaw_bin_deg = ParseNumber<double>(value, key, line_no);
+    else if (key == "yaw_inlier_tol_deg") config.yaw_inlier_tol_deg = ParseNumber<double>(value, key, line_no);
+    else if (key == "yaw_min_tri_inliers") config.yaw_min_tri_inliers = ParseNumber<int>(value, key, line_no);
+    else if (key == "use_dbh_triangle_match") config.use_dbh_triangle_match = ParseBool(value, key, line_no);
+    else if (key == "dbh_diff_tol") config.dbh_diff_tol = ParseNumber<double>(value, key, line_no);
+    else if (key == "match_distance_tol") config.match_distance_tol = ParseNumber<double>(value, key, line_no);
+    else if (key == "use_vertical") config.use_vertical = ParseBool(value, key, line_no);
+    else if (key == "vertical_ransac_iters") config.vertical_ransac_iters = ParseNumber<int>(value, key, line_no);
+    else if (key == "vertical_min_sample") config.vertical_min_sample = ParseNumber<int>(value, key, line_no);
+    else if (key == "z_inlier_tol") config.z_inlier_tol = ParseNumber<double>(value, key, line_no);
+    else if (key == "z_inlier_ratio") config.z_inlier_ratio = ParseNumber<double>(value, key, line_no);
+    else throw std::runtime_error("unknown config key " + key + " on line " + std::to_string(line_no));
 }
 
 }  // namespace
 
-std::filesystem::path GetDefaultConfigPath() {
-    return std::filesystem::path("config") / "default.yaml";
+std::filesystem::path DefaultConfigPath(const std::string& mode) {
+    return std::filesystem::path("config") / (mode == "inter" ? "inter.yaml" : "default.yaml");
 }
 
-bool LoadConfigFromYaml(const std::filesystem::path& yaml_path,
-                        Config& config,
-                        std::string* error) {
+bool LoadConfig(const std::filesystem::path& path, Config& config, std::string* error) {
     try {
-        std::ifstream file(yaml_path);
-        if (!file.is_open()) {
-            throw std::runtime_error("Could not open config file: " + yaml_path.string());
-        }
-
+        std::ifstream in(path);
+        if (!in) throw std::runtime_error("could not open config: " + path.string());
         std::string line;
         size_t line_no = 0;
-
-        while (std::getline(file, line)) {
+        while (std::getline(in, line)) {
             ++line_no;
-            const std::string stripped = StripComment(line);
-            const std::string trimmed = Trim(stripped);
+            const std::string trimmed = Trim(StripComment(line));
             if (trimmed.empty()) continue;
-            if (CountIndent(line) != 0) {
-                throw std::runtime_error("Unsupported indentation on line " +
-                                         std::to_string(line_no));
+            const size_t colon = trimmed.find(':');
+            if (colon == std::string::npos) {
+                throw std::runtime_error("expected key: value on line " + std::to_string(line_no));
             }
-
-            const size_t colon_pos = trimmed.find(':');
-            if (colon_pos == std::string::npos) {
-                throw std::runtime_error("Expected 'key: value' on line " +
-                                         std::to_string(line_no));
-            }
-
-            const std::string key = Trim(trimmed.substr(0, colon_pos));
-            const std::string value = Trim(trimmed.substr(colon_pos + 1));
-            if (key.empty()) {
-                throw std::runtime_error("Empty config key on line " +
-                                         std::to_string(line_no));
-            }
-            AssignScalarField(key, value, config, line_no);
+            Assign(Trim(trimmed.substr(0, colon)), Trim(trimmed.substr(colon + 1)), config, line_no);
         }
-
         RefreshDerivedConfig(config);
-        if (!ValidateConfig(config, error)) {
-            return false;
-        }
-        return true;
+        return ValidateConfig(config, error);
     } catch (const std::exception& ex) {
-        if (error != nullptr) {
-            *error = ex.what();
-        }
+        if (error) *error = ex.what();
         return false;
     }
-}
-
-std::vector<RangeBin> BuildSpatialRangeBins(const Config& config) {
-    std::vector<RangeBin> bins;
-    bins.reserve(config.spatial_bin_count);
-
-    for (int i = 0; i < config.spatial_bin_count; ++i) {
-        const double nominal_start = config.spatial_bin_min + i * config.spatial_bin_interval;
-        const double nominal_end = nominal_start + config.spatial_bin_interval;
-        const double start = std::max(config.spatial_bin_min,
-                                      nominal_start - config.spatial_bin_padding);
-        const double end = std::min(config.spatial_bin_max,
-                                    nominal_end + config.spatial_bin_padding);
-        if (end > start) {
-            bins.emplace_back(start, end);
-        }
-    }
-    return bins;
 }
 
 void RefreshDerivedConfig(Config& config) {
-    config.spatial_range_bins = BuildSpatialRangeBins(config);
+    config.spatial_range_bins.clear();
+    for (int i = 0; i < config.spatial_bin_count; ++i) {
+        const double start0 = config.spatial_bin_min + i * config.spatial_bin_interval;
+        const double end0 = start0 + config.spatial_bin_interval;
+        const double lo = std::max(config.spatial_bin_min, start0 - config.spatial_bin_padding);
+        const double padded_end = (i == 0) ? end0 : end0 + config.spatial_bin_padding;
+        const double hi = std::min(config.spatial_bin_max, padded_end);
+        if (hi > lo) config.spatial_range_bins.emplace_back(lo, hi);
+    }
 }
 
 bool ValidateConfig(const Config& config, std::string* error) {
-    auto fail = [error](const std::string& message) {
-        if (error != nullptr) {
-            *error = message;
-        }
+    auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
         return false;
     };
-
-    if (config.dataset_root.empty()) {
-        return fail("dataset_root must not be empty");
-    }
-    if (config.spatial_threshold <= 0.0) {
-        return fail("spatial_threshold must be positive");
-    }
-    if (config.recall_k <= 0) {
-        return fail("recall_k must be positive");
-    }
-    if (config.histogram_k <= 0) {
-        return fail("histogram_k must be positive");
-    }
-    if (config.knn_k <= 0) {
-        return fail("knn_k must be positive");
-    }
-    if (config.min_dist < 0.0 || config.max_dist <= config.min_dist) {
-        return fail("max_dist must be greater than min_dist and min_dist must be non-negative");
-    }
-    if (config.delta_l <= 0.0) {
-        return fail("delta_l must be positive");
-    }
-    if (config.rho <= 0 || config.hash_modulus <= 0) {
-        return fail("rho and hash_modulus must be positive");
-    }
-    if (config.number_of_cluster <= 0) {
-        return fail("number_of_cluster must be positive");
-    }
-    if (config.min_radius < 0.0 || config.max_radius < config.min_radius) {
-        return fail("max_radius must be at least min_radius and min_radius must be non-negative");
-    }
-    if (config.total_section <= 0) {
-        return fail("total_section must be positive");
-    }
-    if (config.bin_width <= 0.0) {
-        return fail("bin_width must be positive");
-    }
-    if (config.spatial_bin_interval <= 0.0) {
-        return fail("spatial_bin_interval must be positive");
-    }
-    if (config.spatial_bin_padding < 0.0) {
-        return fail("spatial_bin_padding must be non-negative");
-    }
-    if (config.spatial_bin_count <= 0) {
-        return fail("spatial_bin_count must be positive");
-    }
-    if (config.spatial_bin_max <= config.spatial_bin_min) {
-        return fail("spatial_bin_max must be greater than spatial_bin_min");
-    }
-    if (config.spatial_bin_interval * config.spatial_bin_count <
-        config.spatial_bin_max - config.spatial_bin_min) {
-        return fail("spatial_bin_count and spatial_bin_interval must cover spatial_bin_max");
-    }
-
-    const std::vector<RangeBin> spatial_range_bins = BuildSpatialRangeBins(config);
-    if (spatial_range_bins.empty()) {
-        return fail("spatial_range_bins must contain at least one range");
-    }
-
-    for (size_t i = 0; i < spatial_range_bins.size(); ++i) {
-        const auto& [start, end] = spatial_range_bins[i];
-        if (end <= start) {
-            return fail("Each spatial_range_bins entry must satisfy end > start");
-        }
-    }
-
+    if (config.max_frames < 0) return fail("max_frames must be non-negative");
+    if (config.spatial_threshold <= 0.0) return fail("spatial_threshold must be positive");
+    if (config.histogram_k <= 0 || config.rerank_k <= 0) return fail("candidate counts must be positive");
+    if (config.knn_k <= 0) return fail("knn_k must be positive");
+    if (config.max_dist <= config.min_dist) return fail("max_dist must be greater than min_dist");
+    if (config.delta_l <= 0.0) return fail("delta_l must be positive");
+    if (config.number_of_cluster <= 0) return fail("number_of_cluster must be positive");
+    if (config.local_radius <= 0.0) return fail("local_radius must be positive");
+    if (config.total_section <= 0 || config.bin_width <= 0.0) return fail("radius bins are invalid");
+    if (config.pairwise_bins <= 0) return fail("pairwise_bins must be positive");
+    if (config.pairwise_max_dist <= config.pairwise_min_dist) return fail("pairwise distance range is invalid");
+    if (config.spatial_range_bins.empty()) return fail("spatial bins are empty");
     return true;
 }
 
-}  // namespace treeloc
+std::vector<RangeBin> BuildRadiusBins(const Config& config) {
+    std::vector<RangeBin> bins;
+    if (config.total_section == 1) {
+        bins.emplace_back(0.0, std::numeric_limits<double>::infinity());
+        return bins;
+    }
+    const double step = (config.max_radius - config.min_radius) / (config.total_section + 1);
+    for (int i = 0; i < config.total_section - 1; ++i) {
+        const double lo = config.min_radius + i * step;
+        bins.emplace_back(lo, lo + config.bin_width);
+    }
+    bins.emplace_back(bins.back().first + step, std::numeric_limits<double>::infinity());
+    return bins;
+}
+
+}  // namespace treelocpp

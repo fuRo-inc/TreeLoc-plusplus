@@ -1,0 +1,370 @@
+#include "treelocpp/eval.h"
+
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <unordered_set>
+
+#include "treelocpp/descriptors.h"
+#include "treelocpp/geometry.h"
+#include "treelocpp/matching.h"
+
+namespace treelocpp {
+
+namespace {
+
+const std::vector<std::vector<Eigen::Vector2d>>& TestPolygons() {
+    static const std::vector<std::vector<Eigen::Vector2d>> polygons = {
+        {{-468.0, -82.0}, {-468.0, 44.0}, {-314.0, 44.0},
+         {-305.0, 12.0}, {-192.0, 44.0}, {-192.0, -82.0}},
+        {{-78.0, -171.0}, {-78.0, -215.0}, {-305.0, -215.0}, {-305.0, -171.0}},
+        {{-62.0, 70.0}, {95.0, 70.0}, {142.0, 0.0}, {140.0, -142.0}, {-62.0, -142.0}},
+    };
+    return polygons;
+}
+
+bool PointInPolygon(const Eigen::Vector2d& p, const std::vector<Eigen::Vector2d>& poly) {
+    bool inside = false;
+    for (int i = 0, j = static_cast<int>(poly.size()) - 1; i < static_cast<int>(poly.size()); j = i++) {
+        const auto& pi = poly[i];
+        const auto& pj = poly[j];
+        const bool crosses = ((pi.y() > p.y()) != (pj.y() > p.y())) &&
+            (p.x() < (pj.x() - pi.x()) * (p.y() - pi.y()) / (pj.y() - pi.y() + 1e-12) + pi.x());
+        if (crosses) inside = !inside;
+    }
+    return inside;
+}
+
+bool InTestPolygons(const Pose& pose) {
+    const Eigen::Vector2d p(pose.x, pose.y);
+    for (const auto& poly : TestPolygons()) {
+        if (PointInPolygon(p, poly)) return true;
+    }
+    return false;
+}
+
+std::vector<size_t> IntraCandidates(const Dataset& dataset, size_t query_slot, const Config& config) {
+    std::vector<size_t> out;
+    const int qi = dataset.frames[query_slot].index;
+    for (size_t i = 0; i < dataset.frames.size(); ++i) {
+        const int ci = dataset.frames[i].index;
+        if (ci >= qi) continue;
+        if (std::abs(ci - qi) <= config.temporal_min_separation) continue;
+        out.push_back(i);
+    }
+    return out;
+}
+
+std::unordered_set<int> GroundTruth(const Dataset& qset,
+                                    const Dataset& dset,
+                                    size_t query_slot,
+                                    const std::vector<size_t>& candidate_slots,
+                                    const Config& config) {
+    std::unordered_set<int> gt;
+    const Pose& qp = qset.frames[query_slot].pose;
+    for (size_t slot : candidate_slots) {
+        const FrameData& cf = dset.frames[slot];
+        if (PoseDistanceXY(qp, cf.pose) <= config.spatial_threshold) gt.insert(cf.index);
+    }
+    return gt;
+}
+
+void Accumulate(const CandidateResult& best, EvaluationSummary& summary) {
+    summary.mean_spatial_error += best.spatial_error;
+    summary.mean_overlap += best.transform.overlap;
+    summary.mean_z += std::abs(best.vertical.z);
+    summary.mean_roll_deg += std::abs(best.vertical.roll) * 180.0 / M_PI;
+    summary.mean_pitch_deg += std::abs(best.vertical.pitch) * 180.0 / M_PI;
+}
+
+void AccumulateLocalization(const FrameData& qf,
+                            const FrameData& cf,
+                            const CandidateResult& best,
+                            bool is_true_neighbor,
+                            EvaluationSummary& summary) {
+    if (!best.transform.ok) return;
+
+    const Eigen::Matrix4d Tq = PoseToTransform(qf.pose);
+    const Eigen::Matrix4d Tc = PoseToTransform(cf.pose);
+    const Eigen::Matrix4d T_rel_gt = Tq.inverse() * Tc;
+    const Eigen::Vector3d pos_rel_gt = T_rel_gt.block<3, 1>(0, 3);
+    const Eigen::Matrix3d R_rel_gt = T_rel_gt.block<3, 3>(0, 0);
+
+    Eigen::Matrix3d Rz_q2c = Eigen::Matrix3d::Identity();
+    Rz_q2c.block<2, 2>(0, 0) = best.transform.R;
+    const Eigen::Matrix3d R_rp_q2c =
+        Eigen::AngleAxisd(best.vertical.axis_pitch, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+        Eigen::AngleAxisd(best.vertical.axis_roll, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    const Eigen::Matrix3d R_q2c = Rz_q2c * R_rp_q2c;
+    Eigen::Vector3d t_q2c(best.transform.t.x(), best.transform.t.y(), 0.0);
+
+    Eigen::Matrix3d R_c2q = R_q2c.transpose();
+    Eigen::Vector3d t_c2q = -R_c2q * t_q2c;
+    const Eigen::Matrix3d delta_r_c2q =
+        Eigen::AngleAxisd(best.vertical.pitch, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+        Eigen::AngleAxisd(best.vertical.roll, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    R_c2q = delta_r_c2q * R_c2q;
+    t_c2q += Eigen::Vector3d(0.0, 0.0, best.vertical.z);
+
+    Eigen::Matrix4d T_pred_aligned = Eigen::Matrix4d::Identity();
+    T_pred_aligned.block<3, 3>(0, 0) = R_c2q;
+    T_pred_aligned.block<3, 1>(0, 3) = t_c2q;
+
+    const Eigen::Matrix4d T_rel_pred =
+        qf.alignment_transform.inverse() * T_pred_aligned * cf.alignment_transform;
+    const Eigen::Vector3d pos_rel_pred = T_rel_pred.block<3, 1>(0, 3);
+    const Eigen::Matrix3d R_rel_pred = T_rel_pred.block<3, 3>(0, 0);
+
+    double gt_roll = 0.0;
+    double gt_pitch = 0.0;
+    double gt_yaw = 0.0;
+    double pred_roll = 0.0;
+    double pred_pitch = 0.0;
+    double pred_yaw = 0.0;
+    EulerZYX(R_rel_gt, gt_roll, gt_pitch, gt_yaw);
+    EulerZYX(R_rel_pred, pred_roll, pred_pitch, pred_yaw);
+
+    const double txy_err = (pos_rel_gt.head<2>() - pos_rel_pred.head<2>()).norm();
+    const double txyz_err = (pos_rel_gt - pos_rel_pred).norm();
+    const double z_err = std::abs(pos_rel_gt.z() - pos_rel_pred.z());
+    const double roll_err = std::abs(WrapAngle(gt_roll - pred_roll));
+    const double pitch_err = std::abs(WrapAngle(gt_pitch - pred_pitch));
+    const double yaw_err = std::abs(WrapAngle(gt_yaw - pred_yaw));
+    const double rot_norm = std::sqrt(roll_err * roll_err + pitch_err * pitch_err + yaw_err * yaw_err);
+
+    const bool ok_2d = txy_err <= 0.5 && yaw_err * 180.0 / M_PI <= 5.0;
+    const bool ok_6d = txyz_err <= 0.5 && rot_norm * 180.0 / M_PI <= 5.0;
+
+    if (ok_2d) ++summary.localization_2d_recall_success;
+    if (ok_6d) ++summary.localization_6d_recall_success;
+
+    if (is_true_neighbor && ok_2d) {
+        ++summary.localization_2d_true_success;
+        summary.localization_txy_sum += txy_err;
+        summary.localization_yaw_sum += yaw_err;
+    }
+    if (is_true_neighbor && ok_6d) {
+        ++summary.localization_6d_true_success;
+        summary.localization_txyz_sum += txyz_err;
+        summary.localization_z_sum += z_err;
+        summary.localization_roll_sum += roll_err;
+        summary.localization_pitch_sum += pitch_err;
+        summary.localization_yaw6_sum += yaw_err;
+        summary.localization_rot_norm_sum += rot_norm;
+    }
+}
+
+void Finalize(EvaluationSummary& summary) {
+    summary.recall = summary.evaluated > 0
+        ? static_cast<double>(summary.true_positive) / summary.evaluated
+        : 0.0;
+    if (summary.evaluated > 0) {
+        summary.mean_spatial_error /= summary.evaluated;
+        summary.mean_overlap /= summary.evaluated;
+        summary.mean_z /= summary.evaluated;
+        summary.mean_roll_deg /= summary.evaluated;
+        summary.mean_pitch_deg /= summary.evaluated;
+        summary.mean_gt_top_histogram /= summary.evaluated;
+    }
+}
+
+int HashIntersectionEval(const FrameData& qf, const FrameData& cf) {
+    int score = 0;
+    for (const auto& kv : qf.hash_counts) {
+        auto it = cf.hash_counts.find(kv.first);
+        if (it != cf.hash_counts.end()) score += std::min(kv.second, it->second);
+    }
+    return score;
+}
+
+std::pair<int, int> TopCandidateGtCounts(const Dataset& qset,
+                                         const Dataset& dset,
+                                         size_t query_slot,
+                                         const std::vector<size_t>& candidate_slots,
+                                         const std::unordered_set<int>& gt,
+                                         const Config& config) {
+    struct Score {
+        size_t slot;
+        double tdh;
+        double pw;
+        double combined;
+        int hash = 0;
+    };
+    const FrameData& qf = qset.frames[query_slot];
+    std::vector<Score> scores;
+    scores.reserve(candidate_slots.size());
+    for (size_t slot : candidate_slots) {
+        const FrameData& cf = dset.frames[slot];
+        scores.push_back({slot, ChiSquared(qf.tdh, cf.tdh), ChiSquared(qf.pairwise, cf.pairwise), 0.0, 0});
+    }
+    if (scores.empty()) return {0, 0};
+    double tdh_min = std::numeric_limits<double>::infinity();
+    double tdh_max = -std::numeric_limits<double>::infinity();
+    double pw_min = std::numeric_limits<double>::infinity();
+    double pw_max = -std::numeric_limits<double>::infinity();
+    for (const auto& s : scores) {
+        tdh_min = std::min(tdh_min, s.tdh);
+        tdh_max = std::max(tdh_max, s.tdh);
+        pw_min = std::min(pw_min, s.pw);
+        pw_max = std::max(pw_max, s.pw);
+    }
+    const double tdh_den = std::max(tdh_max - tdh_min, 1e-12);
+    const double pw_den = std::max(pw_max - pw_min, 1e-12);
+    for (auto& s : scores) {
+        const double tdh = (s.tdh - tdh_min) / tdh_den;
+        const double pw = (s.pw - pw_min) / pw_den;
+        s.combined = (1.0 - config.pairwise_weight) * tdh + config.pairwise_weight * pw;
+    }
+    const int top_hist = std::min(config.histogram_k, static_cast<int>(scores.size()));
+    auto by_combined = [](const Score& a, const Score& b) {
+        return a.combined < b.combined;
+    };
+    if (top_hist < static_cast<int>(scores.size())) {
+        std::nth_element(scores.begin(), scores.begin() + top_hist, scores.end(), by_combined);
+        scores.resize(top_hist);
+    }
+    std::sort(scores.begin(), scores.end(), by_combined);
+    int gt_hist = 0;
+    for (auto& s : scores) {
+        if (gt.count(dset.frames[s.slot].index)) ++gt_hist;
+        s.hash = HashIntersectionEval(qf, dset.frames[s.slot]);
+    }
+    std::sort(scores.begin(), scores.end(), [](const Score& a, const Score& b) {
+        return a.hash > b.hash;
+    });
+    const int top_hash = std::min(config.rerank_k, static_cast<int>(scores.size()));
+    int gt_hash = 0;
+    for (int i = 0; i < top_hash; ++i) {
+        if (gt.count(dset.frames[scores[i].slot].index)) ++gt_hash;
+    }
+    return {gt_hist, gt_hash};
+}
+
+}  // namespace
+
+EvaluationSummary RunIntraSession(const Config& config) {
+    Dataset dataset = LoadDataset(config.dataset_root, config, config.neighbor_past_only, config.dataset_yaw_deg);
+    EvaluationSummary summary;
+    summary.queries = static_cast<int>(dataset.frames.size());
+    for (size_t q = 0; q < dataset.frames.size(); ++q) {
+        const auto candidates = IntraCandidates(dataset, q, config);
+        if (candidates.empty()) continue;
+        const auto gt = GroundTruth(dataset, dataset, q, candidates, config);
+        if (gt.empty()) continue;
+        auto ranked = RankCandidates(dataset, dataset, q, candidates, config);
+        if (ranked.empty()) continue;
+        CandidateResult best = ranked.front();
+        best.true_neighbor = gt.count(best.candidate_index) > 0;
+        ++summary.evaluated;
+        if (best.true_neighbor) ++summary.true_positive;
+        Accumulate(best, summary);
+        const FrameData& cf = dataset.frames.at(dataset.frame_to_slot.at(best.candidate_index));
+        AccumulateLocalization(dataset.frames[q], cf, best, best.true_neighbor, summary);
+    }
+    Finalize(summary);
+    return summary;
+}
+
+EvaluationSummary RunInterSession(const Config& config) {
+    Dataset queries = LoadDataset(config.query_root, config, config.neighbor_past_only, config.query_yaw_deg);
+    Dataset database = LoadDataset(config.database_root, config, config.neighbor_past_only, config.database_yaw_deg);
+    EvaluationSummary summary;
+    summary.queries = static_cast<int>(queries.frames.size());
+    std::vector<size_t> all_db(database.frames.size());
+    std::iota(all_db.begin(), all_db.end(), 0);
+    for (size_t q = 0; q < queries.frames.size(); ++q) {
+        if (config.use_test_polygons && !InTestPolygons(queries.frames[q].pose)) continue;
+        const auto gt = GroundTruth(queries, database, q, all_db, config);
+        if (gt.empty()) continue;
+        auto ranked = RankCandidates(queries, database, q, all_db, config);
+        if (ranked.empty()) continue;
+        const auto [gt_hist, gt_hash] = TopCandidateGtCounts(queries, database, q, all_db, gt, config);
+        CandidateResult best = ranked.front();
+        best.true_neighbor = gt.count(best.candidate_index) > 0;
+        ++summary.evaluated;
+        if (gt_hist == 0) ++summary.zero_gt_top_histogram;
+        if (gt_hash == 0) ++summary.zero_gt_top_hash;
+        summary.mean_gt_top_histogram += gt_hist;
+        if (best.true_neighbor) ++summary.true_positive;
+        Accumulate(best, summary);
+        const FrameData& cf = database.frames.at(database.frame_to_slot.at(best.candidate_index));
+        AccumulateLocalization(queries.frames[q], cf, best, best.true_neighbor, summary);
+    }
+    Finalize(summary);
+    return summary;
+}
+
+void PrintSummary(const EvaluationSummary& summary, std::ostream& out) {
+    out << std::fixed << std::setprecision(4);
+    out << "Queries: " << summary.queries << "\n";
+    out << "Evaluated queries with GT: " << summary.evaluated << "\n";
+    out << "True positives: " << summary.true_positive << "\n";
+    out << "Recall@1: " << summary.recall << "\n";
+    out << "Mean best spatial error: " << summary.mean_spatial_error << " m\n";
+    out << "Mean best overlap: " << summary.mean_overlap << "\n";
+    out << "Mean |z offset|: " << summary.mean_z << " m\n";
+    out << "Mean |roll|: " << summary.mean_roll_deg << " deg\n";
+    out << "Mean |pitch|: " << summary.mean_pitch_deg << " deg\n";
+    out << "Localization Recall@(|t_xy|<=0.5m & |yaw|<=5deg): "
+        << summary.localization_2d_recall_success << "/" << summary.evaluated
+        << " (" << (summary.evaluated > 0
+            ? 100.0 * summary.localization_2d_recall_success / summary.evaluated
+            : 0.0) << "%)\n";
+    out << "Localization Success@true-pairs 2D: "
+        << summary.localization_2d_true_success << "/" << summary.true_positive
+        << " (" << (summary.true_positive > 0
+            ? 100.0 * summary.localization_2d_true_success / summary.true_positive
+            : 0.0) << "%)\n";
+    out << "Mean localization |t_xy| (succ only): "
+        << (summary.localization_2d_true_success > 0
+            ? summary.localization_txy_sum / summary.localization_2d_true_success
+            : 0.0) << " m\n";
+    out << "Mean localization |yaw_err| (succ only): "
+        << (summary.localization_2d_true_success > 0
+            ? summary.localization_yaw_sum / summary.localization_2d_true_success * 180.0 / M_PI
+            : 0.0) << " deg\n";
+    out << "Localization Recall@6DoF: "
+        << summary.localization_6d_recall_success << "/" << summary.evaluated
+        << " (" << (summary.evaluated > 0
+            ? 100.0 * summary.localization_6d_recall_success / summary.evaluated
+            : 0.0) << "%)\n";
+    out << "Localization Success@true-pairs 6DoF: "
+        << summary.localization_6d_true_success << "/" << summary.true_positive
+        << " (" << (summary.true_positive > 0
+            ? 100.0 * summary.localization_6d_true_success / summary.true_positive
+            : 0.0) << "%)\n";
+    out << "Mean localization |t_xyz| (succ only): "
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_txyz_sum / summary.localization_6d_true_success
+            : 0.0) << " m\n";
+    out << "Mean localization |z| (succ only): "
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_z_sum / summary.localization_6d_true_success
+            : 0.0) << " m\n";
+    out << "Mean localization angles (succ only): roll="
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_roll_sum / summary.localization_6d_true_success * 180.0 / M_PI
+            : 0.0)
+        << " deg, pitch="
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_pitch_sum / summary.localization_6d_true_success * 180.0 / M_PI
+            : 0.0)
+        << " deg, yaw="
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_yaw6_sum / summary.localization_6d_true_success * 180.0 / M_PI
+            : 0.0)
+        << " deg, norm="
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_rot_norm_sum / summary.localization_6d_true_success * 180.0 / M_PI
+            : 0.0) << " deg\n";
+    if (summary.evaluated > 0 && (summary.zero_gt_top_histogram > 0 || summary.mean_gt_top_histogram > 0.0)) {
+        out << "0 GT in Hybrid Top100: " << summary.zero_gt_top_histogram << "/" << summary.evaluated << "\n";
+        out << "0 GT in Hash Top10: " << summary.zero_gt_top_hash << "/" << summary.evaluated << "\n";
+        out << "Average GT in Hybrid Top100: " << summary.mean_gt_top_histogram << "\n";
+    }
+}
+
+}  // namespace treelocpp

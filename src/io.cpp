@@ -1,172 +1,154 @@
-#include "treeloc/io.h"
+#include "treelocpp/io.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
-#include <stdexcept>
-#include <string>
 #include <unordered_map>
-#include <vector>
 
-namespace treeloc {
+namespace treelocpp {
 
 namespace {
 
-std::vector<std::string> SplitCsvLine(const std::string& line) {
+std::vector<std::string> SplitCsv(const std::string& line) {
     std::vector<std::string> cells;
     std::string cell;
     std::stringstream ss(line);
-    while (std::getline(ss, cell, ',')) {
-        cells.push_back(cell);
-    }
-    if (!line.empty() && line.back() == ',') {
-        cells.emplace_back();
-    }
+    while (std::getline(ss, cell, ',')) cells.push_back(cell);
+    if (!line.empty() && line.back() == ',') cells.emplace_back();
     return cells;
 }
 
-bool TryGetCell(const std::vector<std::string>& cells,
-                const std::unordered_map<std::string, size_t>& columns,
-                const std::string& key,
-                std::string& value) {
-    auto it = columns.find(key);
-    if (it == columns.end() || it->second >= cells.size()) {
-        return false;
-    }
-    value = cells[it->second];
-    return true;
-}
-
-double GetRequiredDouble(const std::vector<std::string>& cells,
-                         const std::unordered_map<std::string, size_t>& columns,
-                         const std::string& key) {
-    std::string value;
-    if (!TryGetCell(cells, columns, key, value) || value.empty()) {
-        throw std::invalid_argument("Empty " + key);
-    }
-    return std::stod(value);
-}
-
-double GetOptionalDouble(const std::vector<std::string>& cells,
-                         const std::unordered_map<std::string, size_t>& columns,
-                         const std::string& key,
-                         double fallback) {
-    std::string value;
-    if (!TryGetCell(cells, columns, key, value) || value.empty()) {
+double ToDouble(const std::string& value, double fallback) {
+    if (value.empty()) return fallback;
+    try {
+        return std::stod(value);
+    } catch (...) {
         return fallback;
     }
-    return std::stod(value);
+}
+
+int ToInt(const std::string& value, int fallback) {
+    if (value.empty()) return fallback;
+    if (value == "True" || value == "true") return 1;
+    if (value == "False" || value == "false") return 0;
+    try {
+        return std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::string Cell(const std::vector<std::string>& cells,
+                 const std::unordered_map<std::string, size_t>& columns,
+                 const std::string& name) {
+    auto it = columns.find(name);
+    if (it == columns.end() || it->second >= cells.size()) return "";
+    return cells[it->second];
 }
 
 }  // namespace
 
-std::vector<Point> ReadTrajectory(const std::filesystem::path& filename) {
-    std::vector<Point> trajectory;
-    std::ifstream file(filename);
+std::vector<Pose> ReadTrajectory(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    std::vector<Pose> poses;
     std::string line;
-    while (std::getline(file, line)) {
+    while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::stringstream ss(line);
-        Point point;
-        double time;
-        ss >> time >> point.x >> point.y >> point.z
-           >> point.qx >> point.qy >> point.qz >> point.qw;
-        trajectory.push_back(point);
+        Pose p;
+        ss >> p.stamp >> p.x >> p.y >> p.z >> p.qx >> p.qy >> p.qz >> p.qw;
+        if (!ss.fail()) poses.push_back(p);
     }
-    return trajectory;
+    return poses;
 }
 
-std::vector<TreeData> ReadTreeData(const std::filesystem::path& filename) {
-    std::vector<TreeData> data;
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error opening CSV file: " << filename << '\n';
-        return data;
-    }
+std::vector<Tree> ReadTreeCsv(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    std::vector<Tree> trees;
+    if (!in) return trees;
 
     std::string line;
-    if (!std::getline(file, line)) {
-        return data;
-    }
-
-    auto header = SplitCsvLine(line);
+    if (!std::getline(in, line)) return trees;
+    const auto header = SplitCsv(line);
     std::unordered_map<std::string, size_t> columns;
-    for (size_t i = 0; i < header.size(); ++i) {
-        columns[header[i]] = i;
-    }
+    for (size_t i = 0; i < header.size(); ++i) columns[header[i]] = i;
 
-    int row_num = 0;
-    while (std::getline(file, line)) {
-        ++row_num;
-        try {
-            TreeData td;
-            auto cells = SplitCsvLine(line);
-
-            td.R(0, 0) = GetRequiredDouble(cells, columns, "axis_00");
-            td.R(0, 1) = GetRequiredDouble(cells, columns, "axis_01");
-            td.R(0, 2) = GetRequiredDouble(cells, columns, "axis_02");
-            td.R(1, 0) = GetRequiredDouble(cells, columns, "axis_10");
-            td.R(1, 1) = GetRequiredDouble(cells, columns, "axis_11");
-            td.R(1, 2) = GetRequiredDouble(cells, columns, "axis_12");
-            td.R(2, 0) = GetRequiredDouble(cells, columns, "axis_20");
-            td.R(2, 1) = GetRequiredDouble(cells, columns, "axis_21");
-            td.R(2, 2) = GetRequiredDouble(cells, columns, "axis_22");
-            td.location_x = GetRequiredDouble(cells, columns, "location_x");
-            td.location_y = GetRequiredDouble(cells, columns, "location_y");
-            td.location_z = GetOptionalDouble(
-                cells, columns, "location_z", std::numeric_limits<double>::quiet_NaN());
-            td.dbh = GetOptionalDouble(
-                cells, columns, "dbh", std::numeric_limits<double>::quiet_NaN());
-            td.dbh_approximation = GetOptionalDouble(
-                cells, columns, "dbh_approximation", std::numeric_limits<double>::quiet_NaN());
-            if (!std::isfinite(td.dbh) && !std::isfinite(td.dbh_approximation)) {
-                throw std::invalid_argument("Either dbh or dbh_approximation is required");
+    bool has_axis = true;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!columns.count("axis_" + std::to_string(r) + std::to_string(c))) {
+                has_axis = false;
             }
-            if (!std::isfinite(td.dbh)) {
-                td.dbh = td.dbh_approximation;
-            }
-            if (!std::isfinite(td.dbh_approximation)) {
-                td.dbh_approximation = td.dbh;
-            }
-
-            td.score = GetOptionalDouble(cells, columns, "score", 1.0);
-
-            std::string reconstructed;
-            if (!TryGetCell(cells, columns, "reconstructed", reconstructed) ||
-                reconstructed.empty()) {
-                td.reconstructed = 1;
-            } else if (reconstructed == "True" || reconstructed == "true" ||
-                       reconstructed == "1") {
-                td.reconstructed = 1;
-            } else if (reconstructed == "False" || reconstructed == "false" ||
-                       reconstructed == "0") {
-                td.reconstructed = 0;
-            } else {
-                throw std::invalid_argument("Invalid reconstructed value: " + reconstructed);
-            }
-
-            std::string number_clusters;
-            if (!TryGetCell(cells, columns, "number_clusters", number_clusters) ||
-                number_clusters.empty()) {
-                td.number_clusters = 3;
-            } else {
-                td.number_clusters = std::stoi(number_clusters);
-            }
-
-            if (td.location_x < -30.0 || td.location_x > 30.0 ||
-                td.location_y < -30.0 || td.location_y > 30.0) {
-                continue;
-            }
-
-            data.push_back(td);
-        } catch (const std::exception& e) {
-            std::cerr << "Error parsing row " << row_num << " in " << filename
-                      << ": " << e.what() << " (row content: " << line << ")\n";
         }
     }
 
-    return data;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const auto cells = SplitCsv(line);
+        Tree tree;
+        tree.has_axis = has_axis;
+        if (has_axis) {
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    tree.axis(r, c) =
+                        ToDouble(Cell(cells, columns, "axis_" + std::to_string(r) + std::to_string(c)),
+                                 r == c ? 1.0 : 0.0);
+                }
+            }
+        }
+        tree.x = ToDouble(Cell(cells, columns, "location_x"), std::numeric_limits<double>::quiet_NaN());
+        tree.y = ToDouble(Cell(cells, columns, "location_y"), std::numeric_limits<double>::quiet_NaN());
+        tree.z = ToDouble(Cell(cells, columns, "location_z"), std::numeric_limits<double>::quiet_NaN());
+        tree.alignment_z = ToDouble(Cell(cells, columns, "alignment_z"), tree.z);
+        tree.dbh = ToDouble(Cell(cells, columns, "dbh"), std::numeric_limits<double>::quiet_NaN());
+        tree.dbh_approximation =
+            ToDouble(Cell(cells, columns, "dbh_approximation"), std::numeric_limits<double>::quiet_NaN());
+        if (!std::isfinite(tree.dbh) && std::isfinite(tree.dbh_approximation)) tree.dbh = tree.dbh_approximation;
+        if (!std::isfinite(tree.dbh_approximation) && std::isfinite(tree.dbh)) tree.dbh_approximation = tree.dbh;
+        tree.score = ToDouble(Cell(cells, columns, "score"),
+                              ToDouble(Cell(cells, columns, "scores"), 1.0));
+        tree.reconstructed = ToInt(Cell(cells, columns, "reconstructed"), 1);
+        tree.number_clusters = ToInt(Cell(cells, columns, "number_clusters"), 3);
+        if (std::isfinite(tree.x) && std::isfinite(tree.y) && std::isfinite(tree.dbh)) {
+            trees.push_back(tree);
+        }
+    }
+    return trees;
 }
 
-}  // namespace treeloc
+bool HasFrameCsv(const std::filesystem::path& root, int index) {
+    return std::filesystem::exists(root / ("TreeManagerState_" + std::to_string(index) + ".csv"));
+}
+
+std::vector<int> DiscoverFrameIndices(const std::filesystem::path& root, int max_frames) {
+    std::vector<int> indices;
+    if (max_frames <= 0) {
+        const std::string prefix = "TreeManagerState_";
+        const std::string suffix = ".csv";
+        for (const auto& entry : std::filesystem::directory_iterator(root)) {
+            if (!entry.is_regular_file()) continue;
+            const std::string name = entry.path().filename().string();
+            if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size() + suffix.size()) continue;
+            if (name.substr(name.size() - suffix.size()) != suffix) continue;
+            const std::string id = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+            if (!std::all_of(id.begin(), id.end(), [](unsigned char ch) { return std::isdigit(ch); })) continue;
+            indices.push_back(std::stoi(id));
+        }
+        std::sort(indices.begin(), indices.end());
+        return indices;
+    }
+    for (int i = 0; i < max_frames; ++i) {
+        if (HasFrameCsv(root, i)) indices.push_back(i);
+    }
+    return indices;
+}
+
+std::string DatasetName(const std::filesystem::path& root) {
+    return root.filename().empty() ? root.string() : root.filename().string();
+}
+
+}  // namespace treelocpp

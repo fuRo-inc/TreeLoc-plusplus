@@ -1,524 +1,846 @@
-#include "treeloc/matching.h"
+#include "treelocpp/matching.h"
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <random>
+#include <sstream>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
-#include <vector>
 
-#include <nanoflann.hpp>
+#include "treelocpp/descriptors.h"
+#include "treelocpp/geometry.h"
 
-#include "treeloc/geometry.h"
-#include "treeloc/io.h"
-
-namespace treeloc {
+namespace treelocpp {
 
 namespace {
 
-std::tuple<double, double, double> TriangleSideLengths(
-    const std::vector<Eigen::Vector2d>& points,
-    const std::array<int, 3>& simplex) {
-    const Eigen::Vector2d& p1 = points[simplex[0]];
-    const Eigen::Vector2d& p2 = points[simplex[1]];
-    const Eigen::Vector2d& p3 = points[simplex[2]];
+constexpr std::array<std::array<int, 3>, 6> kPerms{{
+    {{0, 1, 2}}, {{0, 2, 1}}, {{1, 0, 2}},
+    {{1, 2, 0}}, {{2, 0, 1}}, {{2, 1, 0}}
+}};
 
-    std::array<double, 3> lengths = {
-        (p1 - p2).norm(),
-        (p2 - p3).norm(),
-        (p3 - p1).norm()
-    };
-    std::sort(lengths.begin(), lengths.end());
-    return {lengths[0], lengths[1], lengths[2]};
+double TreeRadius(const Tree& tree) {
+    return std::isfinite(tree.dbh) ? tree.dbh : tree.dbh_approximation;
 }
 
-long long TriangleHash(double a, double b, double c, double delta_l, long long rho,
-                       long long hash_modulus) {
-    const int ell_1 = static_cast<int>(std::round(a / delta_l));
-    const int ell_2 = static_cast<int>(std::round(b / delta_l));
-    const int ell_3 = static_cast<int>(std::round(c / delta_l));
-
-    long long hash = (ell_3 * rho + ell_2) % hash_modulus;
-    hash = (hash * rho + ell_1) % hash_modulus;
-    return hash;
+Eigen::Matrix3d ProjectSO3(const Eigen::Matrix3d& R) {
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d U = svd.matrixU();
+    const Eigen::Matrix3d V = svd.matrixV();
+    Eigen::Matrix3d out = U * V.transpose();
+    if (out.determinant() < 0.0) {
+        U.col(2) *= -1.0;
+        out = U * V.transpose();
+    }
+    return out;
 }
 
-std::vector<TreeData> SelectTreesForDescriptors(const std::vector<TreeData>& trees,
-                                                int required_clusters) {
-    std::vector<TreeData> non_reconstructed;
-    std::vector<TreeData> filtered;
-    filtered.reserve(trees.size());
+struct PlaneCorrection {
+    double z = 0.0;
+    double roll = 0.0;
+    double pitch = 0.0;
+    int inliers = 0;
+};
 
-    for (const auto& row : trees) {
-        if (row.reconstructed == 1) {
-            filtered.push_back(row);
-        } else if (row.number_clusters > 2 && row.score > 0.1) {
-            non_reconstructed.push_back(row);
-        }
+PlaneCorrection EstimatePlaneCorrection(const std::vector<double>& delta_z,
+                                        const std::vector<Eigen::Vector2d>& candidate_xy,
+                                        const Config& config) {
+    PlaneCorrection out;
+    const int n = static_cast<int>(delta_z.size());
+    if (n == 0 || candidate_xy.size() != delta_z.size()) return out;
+    if (n < 3) {
+        out.z = std::accumulate(delta_z.begin(), delta_z.end(), 0.0) / n;
+        out.inliers = n;
+        return out;
     }
 
-    if (static_cast<int>(filtered.size()) < required_clusters) {
-        const int need_count = required_clusters - static_cast<int>(filtered.size());
-        std::sort(non_reconstructed.begin(), non_reconstructed.end(),
-                  [](const TreeData& lhs, const TreeData& rhs) { return lhs.score > rhs.score; });
-        for (int i = 0; i < need_count && i < static_cast<int>(non_reconstructed.size()); ++i) {
-            filtered.push_back(non_reconstructed[i]);
-        }
+    Eigen::MatrixXd A_full(n, 3);
+    Eigen::VectorXd b_full(n);
+    for (int i = 0; i < n; ++i) {
+        A_full(i, 0) = 1.0;
+        A_full(i, 1) = candidate_xy[i].y();
+        A_full(i, 2) = -candidate_xy[i].x();
+        b_full(i) = delta_z[i];
     }
 
-    if (static_cast<int>(filtered.size()) < required_clusters) {
-        std::vector<TreeData> supplemental;
-        for (const auto& row : trees) {
-            if (row.reconstructed != 1 && row.number_clusters == 2 && row.score > 0.1) {
-                supplemental.push_back(row);
+    const int sample_size = std::min(std::max(3, config.vertical_min_sample), n);
+    std::mt19937_64 rng(1234);
+    int best_count = -1;
+    std::vector<char> best_inlier;
+    Eigen::Vector3d best_beta = Eigen::Vector3d::Zero();
+
+    for (int iter = 0; iter < std::max(1, config.vertical_ransac_iters); ++iter) {
+        std::vector<int> sample;
+        sample.reserve(sample_size);
+        if (sample_size == n) {
+            sample.resize(n);
+            std::iota(sample.begin(), sample.end(), 0);
+        } else {
+            std::unordered_set<int> used;
+            while (static_cast<int>(sample.size()) < sample_size) {
+                const int idx = static_cast<int>(rng() % static_cast<uint64_t>(n));
+                if (used.insert(idx).second) sample.push_back(idx);
             }
         }
-        std::sort(supplemental.begin(), supplemental.end(),
-                  [](const TreeData& lhs, const TreeData& rhs) { return lhs.score > rhs.score; });
-        const int need_count = required_clusters - static_cast<int>(filtered.size());
-        for (int i = 0; i < need_count && i < static_cast<int>(supplemental.size()); ++i) {
-            filtered.push_back(supplemental[i]);
+
+        Eigen::MatrixXd A(sample_size, 3);
+        Eigen::VectorXd b(sample_size);
+        for (int i = 0; i < sample_size; ++i) {
+            A.row(i) = A_full.row(sample[i]);
+            b(i) = b_full(sample[i]);
+        }
+        const Eigen::Vector3d beta = A.colPivHouseholderQr().solve(b);
+        const Eigen::VectorXd residual = (A_full * beta - b_full).cwiseAbs();
+
+        std::vector<char> inlier(n, 0);
+        int count = 0;
+        for (int i = 0; i < n; ++i) {
+            if (residual(i) <= config.z_inlier_tol) {
+                inlier[i] = 1;
+                ++count;
+            }
+        }
+        if (count > best_count) {
+            best_count = count;
+            best_inlier = std::move(inlier);
+            best_beta = beta;
         }
     }
 
-    std::vector<TreeData> final_trees;
-    final_trees.reserve(filtered.size());
-    for (const auto& row : filtered) {
-        if (row.location_x >= -30.0 && row.location_x <= 30.0 &&
-            row.location_y >= -30.0 && row.location_y <= 30.0) {
-            final_trees.push_back(row);
+    if (best_count < 3) {
+        out.z = std::accumulate(delta_z.begin(), delta_z.end(), 0.0) / n;
+        out.inliers = n;
+        return out;
+    }
+
+    Eigen::MatrixXd A_inlier(best_count, 3);
+    Eigen::VectorXd b_inlier(best_count);
+    int row = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!best_inlier[i]) continue;
+        A_inlier.row(row) = A_full.row(i);
+        b_inlier(row) = b_full(i);
+        ++row;
+    }
+    best_beta = A_inlier.colPivHouseholderQr().solve(b_inlier);
+    out.z = best_beta(0);
+    out.roll = best_beta(1);
+    out.pitch = best_beta(2);
+    out.inliers = best_count;
+    return out;
+}
+
+bool Rigid2D(const std::vector<Eigen::Vector2d>& q,
+             const std::vector<Eigen::Vector2d>& c,
+             Eigen::Matrix2d& R,
+             Eigen::Vector2d& t) {
+    if (q.size() != c.size() || q.size() < 2) return false;
+    Eigen::MatrixXd Q(q.size(), 2);
+    Eigen::MatrixXd C(c.size(), 2);
+    for (size_t i = 0; i < q.size(); ++i) {
+        Q.row(i) = q[i];
+        C.row(i) = c[i];
+    }
+    const Eigen::Vector2d qc = Q.colwise().mean();
+    const Eigen::Vector2d cc = C.colwise().mean();
+    Q.rowwise() -= qc.transpose();
+    C.rowwise() -= cc.transpose();
+    const Eigen::Matrix2d H = Q.transpose() * C;
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    R = svd.matrixV() * svd.matrixU().transpose();
+    if (R.determinant() < 0.0) {
+        Eigen::Matrix2d V = svd.matrixV();
+        V.col(1) *= -1.0;
+        R = V * svd.matrixU().transpose();
+    }
+    t = cc - R * qc;
+    return true;
+}
+
+double TriangleResidual(const std::array<Eigen::Vector2d, 3>& q,
+                        const std::array<Eigen::Vector2d, 3>& c) {
+    std::vector<Eigen::Vector2d> qv(q.begin(), q.end());
+    std::vector<Eigen::Vector2d> cv(c.begin(), c.end());
+    Eigen::Matrix2d R;
+    Eigen::Vector2d t;
+    if (!Rigid2D(qv, cv, R, t)) return std::numeric_limits<double>::infinity();
+    double err = 0.0;
+    for (int i = 0; i < 3; ++i) err += (R * q[i] + t - c[i]).norm();
+    return err / 3.0;
+}
+
+bool BestTrianglePermutation(const FrameData& qf,
+                             const FrameData& cf,
+                             const std::array<int, 3>& qt,
+                             const std::array<int, 3>& ct,
+                             const Config& config,
+                             std::array<int, 3>& best_perm) {
+    std::array<Eigen::Vector2d, 3> qpts;
+    std::array<Eigen::Vector2d, 3> csrc;
+    for (int i = 0; i < 3; ++i) {
+        qpts[i] = qf.centers[qt[i]];
+        csrc[i] = cf.centers[ct[i]];
+    }
+    double best = std::numeric_limits<double>::infinity();
+    bool ok = false;
+    for (const auto& perm : kPerms) {
+        if (config.use_dbh_triangle_match) {
+            bool dbh_ok = true;
+            for (int i = 0; i < 3; ++i) {
+                const double dq = TreeRadius(qf.trees[qt[i]]);
+                const double dc = TreeRadius(cf.trees[ct[perm[i]]]);
+                if (!std::isfinite(dq) || !std::isfinite(dc) ||
+                    std::abs(dq - dc) >= config.dbh_diff_tol) {
+                    dbh_ok = false;
+                    break;
+                }
+            }
+            if (!dbh_ok) continue;
+        }
+        std::array<Eigen::Vector2d, 3> cpts{csrc[perm[0]], csrc[perm[1]], csrc[perm[2]]};
+        const double err = TriangleResidual(qpts, cpts);
+        if (err < best) {
+            best = err;
+            best_perm = perm;
+            ok = true;
         }
     }
-    return final_trees;
+    return ok;
+}
+
+std::unordered_map<long long, std::vector<int>> HashGroups(const std::vector<std::pair<long long, int>>& hashes) {
+    std::unordered_map<long long, std::vector<int>> out;
+    for (const auto& item : hashes) out[item.first].push_back(item.second);
+    return out;
+}
+
+std::vector<MatchPair> NearestMatches(const FrameData& qf,
+                                      const FrameData& cf,
+                                      const Eigen::Matrix2d& R,
+                                      const Eigen::Vector2d& t,
+                                      const Config& config) {
+    std::vector<MatchPair> matches;
+    std::vector<char> q_used(qf.trees.size(), 0);
+    for (int ci = 0; ci < static_cast<int>(cf.trees.size()); ++ci) {
+        int best = -1;
+        double best_d2 = std::numeric_limits<double>::infinity();
+        const Eigen::Vector2d cp(cf.trees[ci].x, cf.trees[ci].y);
+        for (int qi = 0; qi < static_cast<int>(qf.trees.size()); ++qi) {
+            if (q_used[qi]) continue;
+            const double dr = std::abs(TreeRadius(qf.trees[qi]) - TreeRadius(cf.trees[ci]));
+            if (dr >= std::max(0.4, config.dbh_diff_tol * 2.0)) continue;
+            const Eigen::Vector2d qp = R * Eigen::Vector2d(qf.trees[qi].x, qf.trees[qi].y) + t;
+            const double d2 = (qp - cp).squaredNorm();
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = qi;
+            }
+        }
+        if (best >= 0 && std::sqrt(best_d2) <= config.match_distance_tol) {
+            q_used[best] = 1;
+            matches.push_back({best, ci});
+        }
+    }
+    return matches;
+}
+
+double OverlapScore(const FrameData& qf, const FrameData& cf, const std::vector<MatchPair>& matches) {
+    const int inter = static_cast<int>(matches.size());
+    const int uni = static_cast<int>(qf.trees.size() + cf.trees.size() - inter);
+    return uni > 0 ? static_cast<double>(inter) / uni : 0.0;
+}
+
+double TPenalty(const Eigen::Vector2d& t, const Config& config) {
+    if (!config.use_t_aware_overlap) return 1.0;
+    const double norm = t.norm();
+    if (config.t_aware_mode == "inv") {
+        return 1.0 / (1.0 + std::pow(norm / std::max(config.t_aware_tau, 1e-6), config.t_aware_power));
+    }
+    return std::exp(-norm / std::max(config.t_aware_tau, 1e-6));
+}
+
+std::pair<Eigen::Matrix2d, Eigen::Vector2d> VoteYawAndFit(
+    const std::vector<Eigen::Vector2d>& q_centers,
+    const std::vector<Eigen::Vector2d>& c_centers,
+    const std::vector<double>& yaws,
+    const Config& config) {
+    std::vector<int> keep;
+    if (config.use_yaw_voting && static_cast<int>(yaws.size()) >= config.yaw_min_tri_inliers) {
+        const int bins = std::max(1, static_cast<int>(std::llround(360.0 / config.yaw_bin_deg)));
+        std::vector<int> counts(bins, 0);
+        for (double yaw : yaws) {
+            int b = static_cast<int>(std::floor((WrapAngle(yaw) + M_PI) / (2.0 * M_PI) * bins));
+            b = std::clamp(b, 0, bins - 1);
+            ++counts[b];
+        }
+        const int mode = static_cast<int>(std::max_element(counts.begin(), counts.end()) - counts.begin());
+        const double center = -M_PI + (mode + 0.5) * (2.0 * M_PI / bins);
+        const double tol = config.yaw_inlier_tol_deg * M_PI / 180.0;
+        for (int i = 0; i < static_cast<int>(yaws.size()); ++i) {
+            if (std::abs(WrapAngle(yaws[i] - center)) <= tol) keep.push_back(i);
+        }
+    }
+    if (keep.size() < 2) {
+        keep.resize(q_centers.size());
+        std::iota(keep.begin(), keep.end(), 0);
+    }
+    std::vector<Eigen::Vector2d> q;
+    std::vector<Eigen::Vector2d> c;
+    for (int idx : keep) {
+        q.push_back(q_centers[idx]);
+        c.push_back(c_centers[idx]);
+    }
+    Eigen::Matrix2d R = Eigen::Matrix2d::Identity();
+    Eigen::Vector2d t = Eigen::Vector2d::Zero();
+    Rigid2D(q, c, R, t);
+    return {R, t};
+}
+
+void WeightedRigid2D(const Eigen::MatrixXd& q,
+                     const Eigen::MatrixXd& c,
+                     const Eigen::VectorXd& weights,
+                     Eigen::Matrix2d& R,
+                     Eigen::Vector2d& t) {
+    Eigen::VectorXd w = weights.cwiseMax(1e-6);
+    w /= w.sum();
+    const Eigen::Vector2d qc = (q.array().colwise() * w.array()).colwise().sum();
+    const Eigen::Vector2d cc = (c.array().colwise() * w.array()).colwise().sum();
+    Eigen::MatrixXd q0 = q.rowwise() - qc.transpose();
+    Eigen::MatrixXd c0 = c.rowwise() - cc.transpose();
+    const Eigen::Matrix2d H = (q0.array().colwise() * w.array()).matrix().transpose() * c0;
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix2d V = svd.matrixV();
+    R = V * svd.matrixU().transpose();
+    if (R.determinant() < 0.0) {
+        V.col(1) *= -1.0;
+        R = V * svd.matrixU().transpose();
+    }
+    t = cc - R * qc;
+}
+
+std::vector<int> DedupReps(const std::vector<Eigen::Vector2d>& pts) {
+    std::unordered_map<std::string, int> reps;
+    std::vector<int> out(pts.size());
+    reps.reserve(pts.size() * 2);
+    for (int i = 0; i < static_cast<int>(pts.size()); ++i) {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(3) << pts[i].x() << "," << pts[i].y();
+        const std::string key = ss.str();
+        auto it = reps.find(key);
+        if (it == reps.end()) {
+            reps[key] = i;
+            out[i] = i;
+        } else {
+            out[i] = it->second;
+        }
+    }
+    return out;
+}
+
+void HungarianMinCost(const Eigen::MatrixXd& cost,
+                      std::vector<int>& row_ind,
+                      std::vector<int>& col_ind) {
+    const int n = static_cast<int>(cost.rows());
+    const int m = static_cast<int>(cost.cols());
+    const int N = std::max(n, m);
+    row_ind.clear();
+    col_ind.clear();
+    if (N == 0) return;
+    const double big = 1e9;
+    Eigen::MatrixXd a = Eigen::MatrixXd::Constant(N, N, big);
+    a.block(0, 0, n, m) = cost;
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            if (!std::isfinite(a(r, c))) a(r, c) = big;
+        }
+    }
+    std::vector<double> u(N + 1, 0.0), v(N + 1, 0.0), minv(N + 1);
+    std::vector<int> p(N + 1, 0), way(N + 1, 0);
+    std::vector<char> used(N + 1);
+    for (int i = 1; i <= N; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        std::fill(minv.begin(), minv.end(), big);
+        std::fill(used.begin(), used.end(), false);
+        do {
+            used[j0] = true;
+            const int i0 = p[j0];
+            int j1 = 0;
+            double delta = big;
+            for (int j = 1; j <= N; ++j) {
+                if (used[j]) continue;
+                double cur = a(i0 - 1, j - 1) - u[i0] - v[j];
+                if (!std::isfinite(cur)) cur = big;
+                if (cur < minv[j]) {
+                    minv[j] = cur;
+                    way[j] = j0;
+                }
+                if (minv[j] < delta) {
+                    delta = minv[j];
+                    j1 = j;
+                }
+            }
+            if (j1 == 0 || !std::isfinite(delta) || delta >= big * 0.5) {
+                row_ind.clear();
+                col_ind.clear();
+                return;
+            }
+            for (int j = 0; j <= N; ++j) {
+                if (used[j]) {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            const int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0 != 0);
+    }
+    std::vector<int> assignment(N, -1);
+    for (int j = 1; j <= N; ++j) {
+        if (p[j] > 0) assignment[p[j] - 1] = j - 1;
+    }
+    for (int i = 0; i < n; ++i) {
+        const int j = assignment[i];
+        if (0 <= j && j < m) {
+            row_ind.push_back(i);
+            col_ind.push_back(j);
+        }
+    }
+}
+
+int NearestQuery(const FrameData& qf, const Eigen::Matrix2d& R, const Eigen::Vector2d& t,
+                 const Eigen::Vector2d& cp, double max_dist, double* best_dist) {
+    int best = -1;
+    double best_d2 = max_dist * max_dist;
+    for (int qi = 0; qi < static_cast<int>(qf.trees.size()); ++qi) {
+        const Eigen::Vector2d qp = R * Eigen::Vector2d(qf.trees[qi].x, qf.trees[qi].y) + t;
+        const double d2 = (qp - cp).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = qi;
+        }
+    }
+    if (best_dist) *best_dist = std::sqrt(best_d2);
+    return best;
+}
+
+int HashIntersection(const FrameData& qf, const FrameData& cf) {
+    int score = 0;
+    for (const auto& kv : qf.hash_counts) {
+        auto it = cf.hash_counts.find(kv.first);
+        if (it != cf.hash_counts.end()) score += std::min(kv.second, it->second);
+    }
+    return score;
 }
 
 }  // namespace
 
-std::vector<RangeBin> BuildRadiusBins(const Config& config) {
-    std::vector<RangeBin> radius_bins;
-    if (config.total_section != 1) {
-        const double step_size =
-            (config.max_radius - config.min_radius) / (config.total_section + 1);
-        for (int i = 0; i < config.total_section - 1; ++i) {
-            radius_bins.emplace_back(
-                config.min_radius + i * step_size,
-                config.min_radius + i * step_size + config.bin_width);
+Transform2D EstimateTransform2D(const FrameData& query,
+                                const FrameData& candidate,
+                                const Config& config) {
+    Transform2D out;
+    const auto q_groups = HashGroups(query.hashes);
+    const auto c_groups = HashGroups(candidate.hashes);
+
+    std::vector<Eigen::Vector2d> q_centers;
+    std::vector<Eigen::Vector2d> c_centers;
+    std::vector<double> tri_yaws;
+    std::vector<std::pair<int, int>> tri_pairs;
+
+    auto best_perm_residual = [&](const std::array<int, 3>& qt,
+                                  const std::array<int, 3>& ct,
+                                  std::array<int, 3>& best_perm) {
+        std::array<Eigen::Vector2d, 3> qpts;
+        std::array<Eigen::Vector2d, 3> csrc;
+        for (int i = 0; i < 3; ++i) {
+            qpts[i] = query.centers[qt[i]];
+            csrc[i] = candidate.centers[ct[i]];
         }
-        radius_bins.emplace_back(radius_bins.back().first + step_size,
-                                 std::numeric_limits<double>::infinity());
-    } else {
-        radius_bins.emplace_back(0.0, std::numeric_limits<double>::infinity());
-    }
-    return radius_bins;
-}
-
-double GetRadius(const TreeData& row) {
-    return std::isnan(row.dbh) ? row.dbh_approximation : row.dbh;
-}
-
-int GetSpatialRange(const TreeData& row, const std::vector<RangeBin>& spatial_range_bins) {
-    const double distance = std::sqrt(row.location_x * row.location_x +
-                                      row.location_y * row.location_y);
-    for (size_t i = 0; i < spatial_range_bins.size(); ++i) {
-        if (spatial_range_bins[i].first < distance &&
-            distance <= spatial_range_bins[i].second) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
-
-Eigen::MatrixXd ComputeHistogram(const std::vector<TreeData>& trees,
-                                 const std::vector<RangeBin>& spatial_range_bins,
-                                 const std::vector<RangeBin>& radius_bins) {
-    Eigen::MatrixXd histogram(spatial_range_bins.size(), radius_bins.size());
-    histogram.setZero();
-    for (const auto& row : trees) {
-        const double radius = GetRadius(row);
-        const int spatial_bin = GetSpatialRange(row, spatial_range_bins);
-        if (spatial_bin == -1) continue;
-
-        for (size_t j = 0; j < radius_bins.size(); ++j) {
-            if ((radius_bins[j].first < radius && radius <= radius_bins[j].second) ||
-                (j == radius_bins.size() - 1 && radius > radius_bins[j].first)) {
-                histogram(spatial_bin, j) += 1.0;
-                break;
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& perm : kPerms) {
+            std::array<Eigen::Vector2d, 3> cpts{csrc[perm[0]], csrc[perm[1]], csrc[perm[2]]};
+            const double err = TriangleResidual(qpts, cpts);
+            if (err < best) {
+                best = err;
+                best_perm = perm;
             }
         }
-    }
-    return histogram;
-}
-
-double ChiSquaredDistance(const Eigen::MatrixXd& lhs, const Eigen::MatrixXd& rhs) {
-    double sum = 0.0;
-    for (int i = 0; i < lhs.rows(); ++i) {
-        for (int j = 0; j < lhs.cols(); ++j) {
-            const double diff = lhs(i, j) - rhs(i, j);
-            sum += diff * diff / (lhs(i, j) + rhs(i, j) + 1e-10);
-        }
-    }
-    return sum;
-}
-
-KNNTriangles ComputeKnnTriangles(const std::vector<Eigen::Vector2d>& centers,
-                                 int k,
-                                 double min_dist,
-                                 double max_dist) {
-    auto order_by_edge_length = [&](int i, int j, int k_idx) -> std::array<int, 3> {
-        const double d_ij = (centers[i] - centers[j]).squaredNorm();
-        const double d_jk = (centers[j] - centers[k_idx]).squaredNorm();
-        const double d_ki = (centers[k_idx] - centers[i]).squaredNorm();
-
-        int a = i;
-        int b = j;
-        int c = k_idx;
-        double dab = d_ij;
-        double dbc = d_jk;
-        double dca = d_ki;
-
-        if (d_jk >= d_ij && d_jk >= d_ki) {
-            a = j;
-            b = k_idx;
-            c = i;
-            dab = d_jk;
-            dbc = d_ki;
-            dca = d_ij;
-        } else if (d_ki >= d_ij && d_ki >= d_jk) {
-            a = k_idx;
-            b = i;
-            c = j;
-            dab = d_ki;
-            dbc = d_ij;
-            dca = d_jk;
-        }
-
-        if (dbc < dca) {
-            std::swap(a, b);
-            dab = (centers[a] - centers[b]).squaredNorm();
-            dbc = (centers[b] - centers[c]).squaredNorm();
-            dca = (centers[c] - centers[a]).squaredNorm();
-            (void)dab;
-        }
-        return {a, b, c};
+        return std::isfinite(best);
     };
 
-    KNNTriangles triangles;
-    if (centers.size() < 3) return triangles;
-
-    Eigen::MatrixXd points(centers.size(), 2);
-    for (size_t i = 0; i < centers.size(); ++i) {
-        points.row(i) = centers[i];
-    }
-
-    using KDTree =
-        nanoflann::KDTreeEigenMatrixAdaptor<Eigen::MatrixXd, 2,
-                                            nanoflann::metric_L2_Simple>;
-    KDTree tree(2, std::ref(points), 10);
-    tree.index->buildIndex();
-
-    std::set<std::array<int, 3>> triples;
-    std::vector<size_t> idx(k + 1);
-    std::vector<double> d2(k + 1);
-
-    for (size_t i = 0; i < centers.size(); ++i) {
-        nanoflann::KNNResultSet<double> result_set(k + 1);
-        result_set.init(idx.data(), d2.data());
-        tree.index->findNeighbors(result_set, centers[i].data(), {});
-
-        std::vector<int> neighbors;
-        for (size_t j = 1; j < result_set.size(); ++j) {
-            const double distance = std::sqrt(d2[j]);
-            if (distance >= min_dist && distance <= max_dist) {
-                neighbors.push_back(static_cast<int>(idx[j]));
+    auto dbh_perm_cost = [&](const std::array<int, 3>& qt,
+                             const std::array<int, 3>& ct,
+                             std::array<int, 3>& best_perm) {
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& perm : kPerms) {
+            double cost = 0.0;
+            bool ok = true;
+            for (int i = 0; i < 3; ++i) {
+                const double dq = TreeRadius(query.trees[qt[i]]);
+                const double dc = TreeRadius(candidate.trees[ct[perm[i]]]);
+                const double diff = std::abs(dq - dc);
+                if (!std::isfinite(dq) || !std::isfinite(dc) || diff >= config.dbh_diff_tol) {
+                    ok = false;
+                    break;
+                }
+                cost += diff;
+            }
+            if (ok && cost < best) {
+                best = cost;
+                best_perm = perm;
             }
         }
-        std::sort(neighbors.begin(), neighbors.end());
+        return best;
+    };
 
-        for (size_t a = 0; a + 2 < neighbors.size(); ++a) {
-            for (size_t b = a + 1; b + 1 < neighbors.size(); ++b) {
-                for (size_t c = b + 1; c < neighbors.size(); ++c) {
-                    triples.insert(order_by_edge_length(
-                        neighbors[a], neighbors[b], neighbors[c]));
+    auto dbh_permutation_ok = [&](const std::array<int, 3>& qt,
+                                  const std::array<int, 3>& ct,
+                                  const std::array<int, 3>& perm) {
+        for (int i = 0; i < 3; ++i) {
+            const double dq = TreeRadius(query.trees[qt[i]]);
+            const double dc = TreeRadius(candidate.trees[ct[perm[i]]]);
+            if (!std::isfinite(dq) || !std::isfinite(dc) || std::abs(dq - dc) >= config.dbh_diff_tol) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto add_triangle = [&](int qti, int cti, const std::array<int, 3>& perm) {
+        const auto& qt = query.triangles.simplices[qti];
+        const auto& ct = candidate.triangles.simplices[cti];
+        std::vector<Eigen::Vector2d> qv;
+        std::vector<Eigen::Vector2d> cv;
+        qv.reserve(3);
+        cv.reserve(3);
+        for (int k = 0; k < 3; ++k) {
+            qv.push_back(query.centers[qt[k]]);
+            cv.push_back(candidate.centers[ct[perm[k]]]);
+            tri_pairs.push_back({qt[k], ct[perm[k]]});
+        }
+        Eigen::Matrix2d R;
+        Eigen::Vector2d t;
+        if (Rigid2D(qv, cv, R, t)) {
+            tri_yaws.push_back(RotationYaw(R));
+            q_centers.push_back((qv[0] + qv[1] + qv[2]) / 3.0);
+            c_centers.push_back((cv[0] + cv[1] + cv[2]) / 3.0);
+        }
+    };
+
+    for (const auto& kv : q_groups) {
+        auto cit = c_groups.find(kv.first);
+        if (cit == c_groups.end()) continue;
+        const auto& q_list = kv.second;
+        const auto& c_list = cit->second;
+        if (config.use_dbh_triangle_match) {
+            if (q_list.size() == 1 && c_list.size() == 1) {
+                std::array<int, 3> perm{0, 1, 2};
+                if (best_perm_residual(query.triangles.simplices[q_list[0]],
+                                       candidate.triangles.simplices[c_list[0]],
+                                       perm) &&
+                    dbh_permutation_ok(query.triangles.simplices[q_list[0]],
+                                       candidate.triangles.simplices[c_list[0]],
+                                       perm)) {
+                    add_triangle(q_list[0], c_list[0], perm);
+                }
+                continue;
+            }
+
+            Eigen::MatrixXd cost = Eigen::MatrixXd::Constant(q_list.size(), c_list.size(), 1e9);
+            std::map<std::pair<int, int>, std::array<int, 3>> best_perm;
+            for (int qi = 0; qi < static_cast<int>(q_list.size()); ++qi) {
+                for (int ci = 0; ci < static_cast<int>(c_list.size()); ++ci) {
+                    std::array<int, 3> perm{0, 1, 2};
+                    const double c = dbh_perm_cost(query.triangles.simplices[q_list[qi]],
+                                                   candidate.triangles.simplices[c_list[ci]],
+                                                   perm);
+                    if (std::isfinite(c)) {
+                        cost(qi, ci) = c;
+                        best_perm[{qi, ci}] = perm;
+                    }
                 }
             }
-        }
-    }
-
-    triangles.simplices.assign(triples.begin(), triples.end());
-    return triangles;
-}
-
-std::vector<std::pair<long long, int>> GetTriangleHashes(
-    const KNNTriangles& triangles,
-    const std::vector<Eigen::Vector2d>& centers,
-    double delta_l,
-    long long rho,
-    long long hash_modulus) {
-    std::vector<std::pair<long long, int>> hashes;
-    hashes.reserve(triangles.simplices.size());
-    for (size_t simplex_idx = 0; simplex_idx < triangles.simplices.size(); ++simplex_idx) {
-        auto [a, b, c] = TriangleSideLengths(centers, triangles.simplices[simplex_idx]);
-        const double s = (a + b + c) / 2.0;
-        const double area =
-            std::sqrt(std::max(s * (s - a) * (s - b) * (s - c), 0.0));
-        long long hash_value = TriangleHash(a, b, c, delta_l, rho, hash_modulus);
-        const int area_bucket = static_cast<int>(std::round(area / delta_l));
-        hash_value = (hash_value * rho + area_bucket) % hash_modulus;
-        hashes.emplace_back(hash_value, static_cast<int>(simplex_idx));
-    }
-    return hashes;
-}
-
-TransformationResult Compute2DTransformation(
-    const std::vector<Eigen::Vector2d>& query_pts,
-    const std::vector<Eigen::Vector2d>& cand_pts,
-    const KNNTriangles& query_tri,
-    const KNNTriangles& cand_tri,
-    const std::vector<std::pair<long long, int>>& query_hashes,
-    const std::vector<std::pair<long long, int>>& cand_hashes,
-    const std::vector<TreeData>& query_df,
-    const std::vector<TreeData>& cand_df) {
-    TransformationResult result;
-    result.R.setIdentity();
-    result.t.setZero();
-    result.overlap = 0.0;
-
-    std::unordered_map<long long, int> query_hash_to_index;
-    std::unordered_map<long long, int> cand_hash_to_index;
-    for (const auto& [hash, idx] : query_hashes) query_hash_to_index[hash] = idx;
-    for (const auto& [hash, idx] : cand_hashes) cand_hash_to_index[hash] = idx;
-
-    std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> correspondences;
-    for (const auto& [hash, q_idx] : query_hash_to_index) {
-        auto it = cand_hash_to_index.find(hash);
-        if (it == cand_hash_to_index.end()) continue;
-
-        const auto& q_simplex = query_tri.simplices[q_idx];
-        const auto& c_simplex = cand_tri.simplices[it->second];
-        Eigen::Vector2d q_center = (query_pts[q_simplex[0]] + query_pts[q_simplex[1]] +
-                                    query_pts[q_simplex[2]]) /
-                                   3.0;
-        Eigen::Vector2d c_center = (cand_pts[c_simplex[0]] + cand_pts[c_simplex[1]] +
-                                    cand_pts[c_simplex[2]]) /
-                                   3.0;
-        correspondences.emplace_back(q_center, c_center);
-    }
-    if (correspondences.size() < 2) return result;
-
-    const size_t N = correspondences.size();
-    Eigen::MatrixXd query_matrix(N, 2), cand_matrix(N, 2);
-    for (size_t i = 0; i < N; ++i) {
-        query_matrix.row(i) = correspondences[i].first;
-        cand_matrix.row(i) = correspondences[i].second;
-    }
-
-    Eigen::Vector2d query_center = query_matrix.colwise().mean();
-    Eigen::Vector2d cand_center = cand_matrix.colwise().mean();
-    query_matrix.rowwise() -= query_center.transpose();
-    cand_matrix.rowwise() -= cand_center.transpose();
-
-    Eigen::Matrix2d H = query_matrix.transpose() * cand_matrix;
-    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    result.R = svd.matrixV() * svd.matrixU().transpose();
-    if (result.R.determinant() < 0.0) {
-        Eigen::Matrix2d V = svd.matrixV();
-        V.col(1) *= -1.0;
-        result.R = V * svd.matrixU().transpose();
-    }
-    result.t = cand_center - result.R * query_center;
-
-    std::vector<Eigen::Vector2d> transformed_query(query_pts.size());
-    for (size_t i = 0; i < query_pts.size(); ++i) {
-        transformed_query[i] = result.R * query_pts[i] + result.t;
-    }
-
-    Eigen::MatrixXd query_points_matrix(transformed_query.size(), 2);
-    for (size_t i = 0; i < transformed_query.size(); ++i) {
-        query_points_matrix.row(i) = transformed_query[i];
-    }
-
-    using KDTree =
-        nanoflann::KDTreeEigenMatrixAdaptor<Eigen::MatrixXd, 2,
-                                            nanoflann::metric_L2_Simple>;
-    KDTree query_tree(2, std::ref(query_points_matrix), 10);
-    query_tree.index->buildIndex();
-
-    std::vector<TreeMatch> matches;
-    for (size_t cand_idx = 0; cand_idx < cand_df.size(); ++cand_idx) {
-        Eigen::Vector2d cand_position(
-            cand_df[cand_idx].location_x, cand_df[cand_idx].location_y);
-
-        std::vector<size_t> indices(1);
-        std::vector<double> d2(1);
-        nanoflann::KNNResultSet<double> result_set(1);
-        result_set.init(indices.data(), d2.data());
-        query_tree.index->findNeighbors(result_set, cand_position.data(), {});
-
-        const double query_radius = GetRadius(query_df[indices[0]]);
-        const double cand_radius = GetRadius(cand_df[cand_idx]);
-        if (std::abs(query_radius - cand_radius) > 0.4) continue;
-
-        if (std::sqrt(d2[0]) < 0.5) {
-            matches.push_back(
-                {static_cast<int>(indices[0]), static_cast<int>(cand_idx)});
-        }
-    }
-
-    if (matches.size() >= 2) {
-        const size_t M = matches.size();
-        Eigen::MatrixXd refined_query(M, 2), refined_cand(M, 2);
-        for (size_t i = 0; i < M; ++i) {
-            refined_query.row(i) << query_df[matches[i].query_idx].location_x,
-                                     query_df[matches[i].query_idx].location_y;
-            refined_cand.row(i) << cand_df[matches[i].cand_idx].location_x,
-                                    cand_df[matches[i].cand_idx].location_y;
-        }
-
-        query_center = refined_query.colwise().mean();
-        cand_center = refined_cand.colwise().mean();
-        refined_query.rowwise() -= query_center.transpose();
-        refined_cand.rowwise() -= cand_center.transpose();
-        H = refined_query.transpose() * refined_cand;
-
-        svd.compute(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        result.R = svd.matrixV() * svd.matrixU().transpose();
-        if (result.R.determinant() < 0.0) {
-            Eigen::Matrix2d V = svd.matrixV();
-            V.col(1) *= -1.0;
-            result.R = V * svd.matrixU().transpose();
-        }
-        result.t = cand_center - result.R * query_center;
-    }
-
-    for (size_t i = 0; i < query_pts.size(); ++i) {
-        transformed_query[i] = result.R * query_pts[i] + result.t;
-        query_points_matrix.row(i) = transformed_query[i];
-    }
-
-    KDTree final_query_tree(2, std::ref(query_points_matrix), 10);
-    final_query_tree.index->buildIndex();
-
-    matches.clear();
-    for (size_t cand_idx = 0; cand_idx < cand_df.size(); ++cand_idx) {
-        Eigen::Vector2d cand_position(
-            cand_df[cand_idx].location_x, cand_df[cand_idx].location_y);
-
-        std::vector<size_t> indices(1);
-        std::vector<double> d2(1);
-        nanoflann::KNNResultSet<double> result_set(1);
-        result_set.init(indices.data(), d2.data());
-        final_query_tree.index->findNeighbors(result_set, cand_position.data(), {});
-
-        if (std::sqrt(d2[0]) < 0.4) {
-            matches.push_back(
-                {static_cast<int>(indices[0]), static_cast<int>(cand_idx)});
-        }
-    }
-
-    const int intersection = static_cast<int>(matches.size());
-    const int union_count =
-        static_cast<int>(query_df.size() + cand_df.size() - intersection);
-    result.overlap = union_count > 0 ? static_cast<double>(intersection) / union_count : 0.0;
-    result.matches = std::move(matches);
-    return result;
-}
-
-PrecomputedData ProcessFile(int frame_idx,
-                            const DatasetContext& context,
-                            const Config& config,
-                            const std::vector<RangeBin>& radius_bins) {
-    PrecomputedData data;
-    const fs::path file =
-        context.dataset_root / ("TreeManagerState_" + std::to_string(frame_idx) + ".csv");
-    std::ifstream input(file);
-    if (!input.good()) {
-        return data;
-    }
-
-    auto trees = ReadTreeData(file);
-
-    std::vector<Eigen::Matrix4d> scene_axes;
-    scene_axes.reserve(trees.size());
-    for (const auto& row : trees) {
-        if (row.reconstructed != 1) continue;
-        if (row.location_x < -30.0 || row.location_x > 30.0 ||
-            row.location_y < -30.0 || row.location_y > 30.0) {
-            continue;
-        }
-
-        Eigen::Matrix4d axis_transform = Eigen::Matrix4d::Identity();
-        axis_transform.block<3, 3>(0, 0) = row.R;
-        scene_axes.push_back(axis_transform);
-    }
-    data.scene_transform = ComputeGlobalZAlignmentFallback(scene_axes);
-
-    std::vector<TreeData> aligned_trees;
-    aligned_trees.reserve(trees.size());
-    for (const auto& row : trees) {
-        TreeData transformed = row;
-        if (std::isfinite(row.location_z)) {
-            transformed = ApplySceneTransform(row, data.scene_transform);
+            std::vector<int> rows;
+            std::vector<int> cols;
+            HungarianMinCost(cost, rows, cols);
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+                const int r = rows[i];
+                const int c = cols[i];
+                if (cost(r, c) >= 1e9) continue;
+                auto it = best_perm.find({r, c});
+                if (it == best_perm.end()) continue;
+                add_triangle(q_list[r], c_list[c], it->second);
+            }
         } else {
-            Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
-            transform.block<3, 3>(0, 0) = row.R;
-            transform.block<3, 1>(0, 3) = Eigen::Vector3d(row.location_x, row.location_y, 0.0);
-            transform = data.scene_transform * transform;
-            transformed.R = transform.block<3, 3>(0, 0);
-            transformed.location_x = transform(0, 3);
-            transformed.location_y = transform(1, 3);
-            transformed.location_z = row.location_z;
-        }
-        aligned_trees.push_back(transformed);
-    }
-
-    auto selected_trees = SelectTreesForDescriptors(aligned_trees, config.number_of_cluster);
-    if (selected_trees.empty()) {
-        data.histogram =
-            Eigen::MatrixXd::Zero(config.spatial_range_bins.size(), radius_bins.size());
-        return data;
-    }
-
-    data.histogram =
-        ComputeHistogram(selected_trees, config.spatial_range_bins, radius_bins);
-
-    Eigen::MatrixXd kernel(2, 2);
-    kernel.setOnes();
-    Eigen::MatrixXd hist_smoothed =
-        Eigen::MatrixXd::Zero(data.histogram.rows(), data.histogram.cols());
-
-    for (int i = 0; i < data.histogram.rows(); ++i) {
-        for (int j = 0; j < data.histogram.cols(); ++j) {
-            for (int di = 0; di < 2; ++di) {
-                for (int dj = 0; dj < 2; ++dj) {
-                    const int ni = i + di;
-                    const int nj = j + dj;
-                    if (ni < data.histogram.rows() && nj < data.histogram.cols()) {
-                        hist_smoothed(i, j) += kernel(di, dj) * data.histogram(ni, nj);
+            for (int qti : q_list) {
+                for (int cti : c_list) {
+                    std::array<int, 3> perm{0, 1, 2};
+                    if (best_perm_residual(query.triangles.simplices[qti], candidate.triangles.simplices[cti], perm)) {
+                        add_triangle(qti, cti, perm);
                     }
                 }
             }
         }
     }
 
-    data.histogram = hist_smoothed;
-    data.centers.resize(selected_trees.size());
-    for (size_t i = 0; i < selected_trees.size(); ++i) {
-        data.centers[i] =
-            Eigen::Vector2d(selected_trees[i].location_x, selected_trees[i].location_y);
+    const auto q_reps = DedupReps(query.centers);
+    const auto c_reps = DedupReps(candidate.centers);
+    std::set<std::pair<int, int>> pair_set;
+    for (const auto& pair : tri_pairs) pair_set.insert({q_reps[pair.first], c_reps[pair.second]});
+    if (pair_set.size() < 2) return out;
+
+    Eigen::Matrix2d R = Eigen::Matrix2d::Identity();
+    Eigen::Vector2d t = Eigen::Vector2d::Zero();
+    if (config.use_yaw_voting && static_cast<int>(tri_yaws.size()) >= config.yaw_min_tri_inliers) {
+        const int nbin = static_cast<int>(std::llround(360.0 / std::max(config.yaw_bin_deg, 1e-6))) + 1;
+        std::vector<int> hist(nbin - 1, 0);
+        std::vector<double> edges(nbin);
+        for (int i = 0; i < nbin; ++i) {
+            edges[i] = -M_PI + (2.0 * M_PI) * static_cast<double>(i) / static_cast<double>(nbin - 1);
+        }
+        for (double yaw : tri_yaws) {
+            int bin = 0;
+            while (bin < nbin - 1 && !(edges[bin] <= yaw && yaw < edges[bin + 1])) ++bin;
+            if (bin >= nbin - 1) bin = nbin - 2;
+            ++hist[bin];
+        }
+        const int mode = static_cast<int>(std::max_element(hist.begin(), hist.end()) - hist.begin());
+        const double center = 0.5 * (edges[mode] + edges[mode + 1]);
+        const double tol = config.yaw_inlier_tol_deg * M_PI / 180.0;
+        std::vector<Eigen::Vector2d> q_init;
+        std::vector<Eigen::Vector2d> c_init;
+        for (int i = 0; i < static_cast<int>(tri_yaws.size()); ++i) {
+            if (std::abs(WrapAngle(tri_yaws[i] - center)) <= tol) {
+                q_init.push_back(q_centers[i]);
+                c_init.push_back(c_centers[i]);
+            }
+        }
+        if (q_init.size() >= 2) {
+            Rigid2D(q_init, c_init, R, t);
+        }
     }
 
-    data.tri = ComputeKnnTriangles(
-        data.centers, config.knn_k, config.min_dist, config.max_dist);
-    data.hash_list = GetTriangleHashes(
-        data.tri, data.centers, config.delta_l, config.rho, config.hash_modulus);
-    for (const auto& hash : data.hash_list) {
-        data.hash_set.insert(hash.first);
+    Eigen::MatrixXd q_pairs(pair_set.size(), 2);
+    Eigen::MatrixXd c_pairs(pair_set.size(), 2);
+    int row = 0;
+    for (const auto& pair : pair_set) {
+        q_pairs.row(row) = query.centers[pair.first];
+        c_pairs.row(row) = candidate.centers[pair.second];
+        ++row;
     }
-    data.df = std::move(selected_trees);
-    return data;
+    Eigen::MatrixXd pred = ((q_pairs * R.transpose()).rowwise() + t.transpose()).eval();
+    Eigen::VectorXd residual = (pred - c_pairs).rowwise().norm();
+    Eigen::VectorXd weights = residual.unaryExpr([](double r) {
+        return r <= 0.4 ? 1.0 : 0.4 / (r + 1e-9);
+    });
+    for (int iter = 0; iter < 5; ++iter) {
+        WeightedRigid2D(q_pairs, c_pairs, weights, R, t);
+        pred = ((q_pairs * R.transpose()).rowwise() + t.transpose()).eval();
+        residual = (pred - c_pairs).rowwise().norm();
+        weights = residual.unaryExpr([](double r) {
+            return r <= 0.4 ? 1.0 : 0.4 / (r + 1e-9);
+        });
+    }
+
+    std::vector<Eigen::Vector2d> refine_q;
+    std::vector<Eigen::Vector2d> refine_c;
+    for (int ci = 0; ci < static_cast<int>(candidate.trees.size()); ++ci) {
+        const Eigen::Vector2d cp(candidate.trees[ci].x, candidate.trees[ci].y);
+        double dist = 0.0;
+        const int qi = NearestQuery(query, R, t, cp, config.match_distance_tol, &dist);
+        if (qi >= 0) {
+            refine_q.emplace_back(query.trees[qi].x, query.trees[qi].y);
+            refine_c.push_back(cp);
+        }
+    }
+    if (refine_q.size() >= 2) {
+        Rigid2D(refine_q, refine_c, R, t);
+    }
+
+    std::vector<MatchPair> matches;
+    for (int ci = 0; ci < static_cast<int>(candidate.trees.size()); ++ci) {
+        const Eigen::Vector2d cp(candidate.trees[ci].x, candidate.trees[ci].y);
+        double dist = 0.0;
+        const int qi = NearestQuery(query, R, t, cp, config.match_distance_tol, &dist);
+        if (qi >= 0) matches.push_back({qi, ci});
+    }
+
+    out.R = R;
+    out.t = t;
+    out.pairs = std::move(matches);
+    out.overlap = OverlapScore(query, candidate, out.pairs) * TPenalty(t, config);
+    out.ok = out.pairs.size() >= 2;
+    return out;
 }
 
-}  // namespace treeloc
+PoseCorrection EstimateVerticalCorrection(const FrameData& query,
+                                          const FrameData& candidate,
+                                          const Transform2D& transform,
+                                          const Config& config) {
+    PoseCorrection out;
+    if (!config.use_vertical || transform.pairs.empty()) return out;
+
+    std::vector<Eigen::Vector3d> uq;
+    std::vector<Eigen::Vector3d> uc;
+    uq.reserve(transform.pairs.size());
+    uc.reserve(transform.pairs.size());
+    for (const auto& pair : transform.pairs) {
+        const Tree& qt = query.trees[pair.query];
+        const Tree& ct = candidate.trees[pair.candidate];
+        uq.push_back(TreeUp(qt));
+        uc.push_back(TreeUp(ct));
+    }
+
+    Eigen::Matrix3d R_rp_q2c = Eigen::Matrix3d::Identity();
+    if (uq.size() >= 2) {
+        Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
+        Rz.block<2, 2>(0, 0) = transform.R;
+        Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
+        for (size_t i = 0; i < uq.size(); ++i) {
+            Eigen::Vector3d c_in_q = Rz.transpose() * uc[i];
+            if (uq[i].dot(c_in_q) < 0.0) c_in_q = -c_in_q;
+            M += c_in_q * uq[i].transpose();
+        }
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(M, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        Eigen::Matrix3d V = svd.matrixV();
+        Eigen::Matrix3d R = U * V.transpose();
+        if (R.determinant() < 0.0) {
+            U.col(2) *= -1.0;
+            R = U * V.transpose();
+        }
+        const double yaw = std::atan2(R(1, 0), R(0, 0));
+        R_rp_q2c =
+            Eigen::AngleAxisd(-yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix() * R;
+        R_rp_q2c = ProjectSO3(R_rp_q2c);
+        double roll = 0.0;
+        double pitch = 0.0;
+        double yaw_rp = 0.0;
+        EulerZYX(R_rp_q2c, roll, pitch, yaw_rp);
+        out.axis_roll = roll;
+        out.axis_pitch = pitch;
+    }
+
+    Eigen::Matrix3d Rz_q2c = Eigen::Matrix3d::Identity();
+    Rz_q2c.block<2, 2>(0, 0) = transform.R;
+    const Eigen::Matrix3d R_q2c = Rz_q2c * R_rp_q2c;
+    const Eigen::Vector3d t_q2c(transform.t.x(), transform.t.y(), 0.0);
+    const Eigen::Matrix3d R_c2q = R_q2c.transpose();
+    const Eigen::Vector3d t_c2q = -R_c2q * t_q2c;
+
+    std::vector<double> dz;
+    std::vector<Eigen::Vector2d> candidate_xy;
+    dz.reserve(transform.pairs.size());
+    candidate_xy.reserve(transform.pairs.size());
+    for (const auto& pair : transform.pairs) {
+        const Tree& qt = query.trees[pair.query];
+        const Tree& ct = candidate.trees[pair.candidate];
+        if (!std::isfinite(qt.z) || !std::isfinite(ct.z)) continue;
+        const Eigen::Vector3d c_in_q =
+            R_c2q * Eigen::Vector3d(ct.x, ct.y, ct.z) + t_c2q;
+        if (!c_in_q.allFinite()) continue;
+        dz.push_back(qt.z - c_in_q.z());
+        candidate_xy.emplace_back(c_in_q.x(), c_in_q.y());
+    }
+    const PlaneCorrection plane = EstimatePlaneCorrection(dz, candidate_xy, config);
+    if (plane.inliers > 0) {
+        out.z = plane.z;
+        out.roll = plane.roll;
+        out.pitch = plane.pitch;
+        out.inliers = plane.inliers;
+    }
+    return out;
+}
+
+std::vector<CandidateResult> RankCandidates(const Dataset& query_set,
+                                            const Dataset& database_set,
+                                            size_t query_slot,
+                                            const std::vector<size_t>& candidate_slots,
+                                            const Config& config) {
+    const FrameData& qf = query_set.frames[query_slot];
+    struct Score {
+        size_t slot;
+        double tdh;
+        double pw;
+        double combined;
+        int hash;
+    };
+    std::vector<Score> scores;
+    scores.reserve(candidate_slots.size());
+    for (size_t slot : candidate_slots) {
+        const FrameData& cf = database_set.frames[slot];
+        scores.push_back({slot, ChiSquared(qf.tdh, cf.tdh), ChiSquared(qf.pairwise, cf.pairwise), 0.0, 0});
+    }
+    if (scores.empty()) return {};
+
+    auto minmax = [](const std::vector<Score>& v, auto member) {
+        double mn = std::numeric_limits<double>::infinity();
+        double mx = -std::numeric_limits<double>::infinity();
+        for (const auto& s : v) {
+            const double x = member(s);
+            mn = std::min(mn, x);
+            mx = std::max(mx, x);
+        }
+        return std::pair<double, double>{mn, mx};
+    };
+    const auto [tdh_min, tdh_max] = minmax(scores, [](const Score& s) { return s.tdh; });
+    const auto [pw_min, pw_max] = minmax(scores, [](const Score& s) { return s.pw; });
+    const double tdh_den = std::max(tdh_max - tdh_min, 1e-12);
+    const double pw_den = std::max(pw_max - pw_min, 1e-12);
+    for (auto& s : scores) {
+        const double tdh = (s.tdh - tdh_min) / tdh_den;
+        const double pw = (s.pw - pw_min) / pw_den;
+        s.combined = (1.0 - config.pairwise_weight) * tdh + config.pairwise_weight * pw;
+    }
+    const int top_hist = std::min(config.histogram_k, static_cast<int>(scores.size()));
+    auto by_combined = [](const Score& a, const Score& b) {
+        return a.combined < b.combined;
+    };
+    if (top_hist < static_cast<int>(scores.size())) {
+        std::nth_element(scores.begin(), scores.begin() + top_hist, scores.end(), by_combined);
+        scores.resize(top_hist);
+    }
+    std::sort(scores.begin(), scores.end(), by_combined);
+    for (auto& s : scores) {
+        s.hash = HashIntersection(qf, database_set.frames[s.slot]);
+    }
+    std::sort(scores.begin(), scores.end(), [](const Score& a, const Score& b) {
+        if (a.hash != b.hash) return a.hash > b.hash;
+        return a.combined < b.combined;
+    });
+    if (static_cast<int>(scores.size()) > config.rerank_k) scores.resize(config.rerank_k);
+
+    std::vector<CandidateResult> results;
+    results.reserve(scores.size());
+    for (const auto& score : scores) {
+        const FrameData& cf = database_set.frames[score.slot];
+        CandidateResult result;
+        result.query_index = qf.index;
+        result.candidate_index = cf.index;
+        result.retrieval_score = score.combined;
+        result.hash_score = score.hash;
+        result.transform = EstimateTransform2D(qf, cf, config);
+        result.vertical = EstimateVerticalCorrection(qf, cf, result.transform, config);
+        result.spatial_error = PoseDistanceXY(qf.pose, cf.pose);
+        results.push_back(std::move(result));
+    }
+    std::sort(results.begin(), results.end(), [](const CandidateResult& a, const CandidateResult& b) {
+        if (a.transform.overlap != b.transform.overlap) return a.transform.overlap > b.transform.overlap;
+        if (a.hash_score != b.hash_score) return a.hash_score > b.hash_score;
+        return a.retrieval_score < b.retrieval_score;
+    });
+    return results;
+}
+
+}  // namespace treelocpp

@@ -1,33 +1,30 @@
 cmake_minimum_required(VERSION 3.16)
+project(TreeLocPP LANGUAGES CXX)
 
-project(TreeLoc LANGUAGES CXX)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Eigen3 REQUIRED)
-find_package(OpenMP REQUIRED)
 
-add_library(treeloc
+add_library(treelocpp
     src/config.cpp
-    src/io.cpp
+    src/descriptors.cpp
+    src/eval.cpp
     src/geometry.cpp
+    src/io.cpp
     src/matching.cpp
-    src/app.cpp
 )
 
-target_include_directories(treeloc
-    PUBLIC
-        ${PROJECT_SOURCE_DIR}/include
-        ${PROJECT_SOURCE_DIR}
-)
+target_include_directories(treelocpp PUBLIC include)
+target_link_libraries(treelocpp PUBLIC Eigen3::Eigen)
 
-target_link_libraries(treeloc
-    PUBLIC
-        Eigen3::Eigen
-        OpenMP::OpenMP_CXX
-)
+add_executable(treelocpp_intra apps/intra.cpp)
+target_link_libraries(treelocpp_intra PRIVATE treelocpp)
 
-add_executable(tree_localization_main tree_localization_main.cpp)
-target_link_libraries(tree_localization_main PRIVATE treeloc)
+add_executable(treelocpp_inter apps/inter.cpp)
+target_link_libraries(treelocpp_inter PRIVATE treelocpp)
