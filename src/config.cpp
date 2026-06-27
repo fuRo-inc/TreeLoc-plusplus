@@ -200,7 +200,7 @@ void Assign(const std::string& key, const std::string& value, Config& config, si
 }  // namespace
 
 std::filesystem::path DefaultConfigPath(const std::string& mode) {
-    return std::filesystem::path("config") / (mode == "inter" ? "inter_v02_v03.yaml" : "full_v02.yaml");
+    return std::filesystem::path("config") / (mode == "inter" ? "inter_v01_v02.yaml" : "full_v02.yaml");
 }
 
 bool LoadConfig(const std::filesystem::path& path, Config& config, std::string* error) {

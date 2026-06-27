@@ -11,7 +11,7 @@ namespace treelocpp {
 struct Config {
     std::string mode = "intra";
     std::filesystem::path dataset_root = "data/Wild_V02";
-    std::filesystem::path query_root = "data/Wild_V03";
+    std::filesystem::path query_root = "data/Wild_V01";
     std::filesystem::path database_root = "data/Wild_V02";
     std::vector<std::filesystem::path> query_roots;
     std::vector<std::filesystem::path> database_roots;
