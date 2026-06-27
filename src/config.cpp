@@ -133,6 +133,8 @@ void Assign(const std::string& key, const std::string& value, Config& config, si
     else if (IsKey(normalized, {"database_labels", "map_labels", "dataset.map_labels", "dataset.database_labels"})) config.database_labels = ParseStringList(value);
     else if (IsKey(normalized, {"max_frames", "frame_limit", "dataset.frame_limit"})) config.max_frames = ParseNumber<int>(value, normalized, line_no);
     else if (IsKey(normalized, {"spatial_threshold", "gt_radius_m", "evaluation.gt_radius_m"})) config.spatial_threshold = ParseNumber<double>(value, normalized, line_no);
+    else if (IsKey(normalized, {"localization_translation_threshold_m", "evaluation.localization_translation_threshold_m", "r50_translation_threshold_m", "evaluation.r50_translation_threshold_m"})) config.localization_translation_threshold_m = ParseNumber<double>(value, normalized, line_no);
+    else if (IsKey(normalized, {"localization_rotation_threshold_deg", "evaluation.localization_rotation_threshold_deg", "r50_rotation_threshold_deg", "evaluation.r50_rotation_threshold_deg"})) config.localization_rotation_threshold_deg = ParseNumber<double>(value, normalized, line_no);
     else if (IsKey(normalized, {"use_test_polygons", "evaluation.use_test_regions"})) config.use_test_polygons = ParseBool(value, normalized, line_no);
     else if (IsKey(normalized, {"test_polygon_family", "evaluation.test_region_family"})) config.test_polygon_family = Lower(ParseString(value));
     else if (IsKey(normalized, {"temporal_min_separation", "evaluation.intra_exclusion_frames"})) config.temporal_min_separation = ParseNumber<int>(value, normalized, line_no);
@@ -200,7 +202,7 @@ void Assign(const std::string& key, const std::string& value, Config& config, si
 }  // namespace
 
 std::filesystem::path DefaultConfigPath(const std::string& mode) {
-    return std::filesystem::path("config") / (mode == "inter" ? "inter_v01_v02.yaml" : "full_v02.yaml");
+    return std::filesystem::path("config") / (mode == "inter" ? "inter_v03_v04.yaml" : "full_v04.yaml");
 }
 
 bool LoadConfig(const std::filesystem::path& path, Config& config, std::string* error) {
@@ -259,6 +261,8 @@ bool ValidateConfig(const Config& config, std::string* error) {
     };
     if (config.max_frames < 0) return fail("max_frames must be non-negative");
     if (config.spatial_threshold <= 0.0) return fail("spatial_threshold must be positive");
+    if (config.localization_translation_threshold_m <= 0.0) return fail("localization_translation_threshold_m must be positive");
+    if (config.localization_rotation_threshold_deg <= 0.0) return fail("localization_rotation_threshold_deg must be positive");
     if (config.histogram_k <= 0 || config.rerank_k <= 0) return fail("candidate counts must be positive");
     if (config.knn_k <= 0) return fail("knn_k must be positive");
     if (config.max_dist <= config.min_dist) return fail("max_dist must be greater than min_dist");

@@ -10,9 +10,9 @@ namespace treelocpp {
 
 struct Config {
     std::string mode = "intra";
-    std::filesystem::path dataset_root = "data/Wild_V02";
-    std::filesystem::path query_root = "data/Wild_V01";
-    std::filesystem::path database_root = "data/Wild_V02";
+    std::filesystem::path dataset_root = "data/Wild_V04";
+    std::filesystem::path query_root = "data/Wild_V03";
+    std::filesystem::path database_root = "data/Wild_V04";
     std::vector<std::filesystem::path> query_roots;
     std::vector<std::filesystem::path> database_roots;
     std::vector<std::string> query_labels;
@@ -20,6 +20,8 @@ struct Config {
 
     int max_frames = 0;
     double spatial_threshold = 5.0;
+    double localization_translation_threshold_m = 0.5;
+    double localization_rotation_threshold_deg = 5.0;
     bool use_test_polygons = false;
     std::string test_polygon_family = "auto";
     int temporal_min_separation = 50;

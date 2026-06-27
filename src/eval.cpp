@@ -93,11 +93,11 @@ std::ofstream OpenPoseEdgeFile(const Config& config, const std::string& name) {
     return out;
 }
 
-void WritePoseEdge(std::ostream& out,
+bool WritePoseEdge(std::ofstream& out,
                    const FrameData& qf,
                    const FrameData& cf,
                    const CandidateResult& result) {
-    if (!out || !result.transform.ok) return;
+    if (!out.is_open() || !out || !result.transform.ok) return false;
     const Eigen::Matrix4d T = PredictedRelativeTransform(qf, cf, result);
     double roll = 0.0;
     double pitch = 0.0;
@@ -107,6 +107,7 @@ void WritePoseEdge(std::ostream& out,
     out << qf.index << " " << cf.index << " " << result.transform.overlap
         << " " << t.x() << " " << t.y() << " " << t.z()
         << " " << roll << " " << pitch << " " << yaw << "\n";
+    return true;
 }
 
 std::vector<std::filesystem::path> QueryRoots(const Config& config) {
@@ -279,10 +280,18 @@ void Accumulate(const CandidateResult& best, EvaluationSummary& summary) {
     summary.mean_pitch_deg += std::abs(best.vertical.pitch) * 180.0 / M_PI;
 }
 
+void AccumulateRetrieval(const CandidateResult& best,
+                         bool is_true_neighbor,
+                         EvaluationSummary& summary) {
+    summary.retrieval_scores.push_back(std::max(0.0, best.transform.overlap));
+    summary.retrieval_labels.push_back(is_true_neighbor ? 1 : 0);
+}
+
 LocalizationDetail AccumulateLocalization(const FrameData& qf,
                                           const FrameData& cf,
                                           const CandidateResult& best,
                                           bool is_true_neighbor,
+                                          const Config& config,
                                           EvaluationSummary& summary) {
     LocalizationDetail detail;
     if (!best.transform.ok) return detail;
@@ -313,8 +322,10 @@ LocalizationDetail AccumulateLocalization(const FrameData& qf,
     const double yaw_err = std::abs(WrapAngle(gt_yaw - pred_yaw));
     const double rot_norm = std::sqrt(roll_err * roll_err + pitch_err * pitch_err + yaw_err * yaw_err);
 
-    const bool ok_2d = txy_err <= 0.5 && yaw_err * 180.0 / M_PI <= 5.0;
-    const bool ok_6d = txyz_err <= 0.5 && rot_norm * 180.0 / M_PI <= 5.0;
+    const bool ok_2d = txy_err <= config.localization_translation_threshold_m &&
+        yaw_err * 180.0 / M_PI <= config.localization_rotation_threshold_deg;
+    const bool ok_6d = txyz_err <= config.localization_translation_threshold_m &&
+        rot_norm * 180.0 / M_PI <= config.localization_rotation_threshold_deg;
 
     detail.valid = true;
     detail.ok_2d = ok_2d;
@@ -327,14 +338,18 @@ LocalizationDetail AccumulateLocalization(const FrameData& qf,
     detail.yaw = yaw_err;
     detail.rot_norm = rot_norm;
 
-    if (is_true_neighbor && ok_2d) {
+    if (ok_2d) {
         ++summary.localization_2d_recall_success;
+    }
+    if (is_true_neighbor && ok_2d) {
         ++summary.localization_2d_true_success;
         summary.localization_txy_sum += txy_err;
         summary.localization_yaw_sum += yaw_err;
     }
-    if (is_true_neighbor && ok_6d) {
+    if (ok_6d) {
         ++summary.localization_6d_recall_success;
+    }
+    if (is_true_neighbor && ok_6d) {
         ++summary.localization_6d_true_success;
         summary.localization_txyz_sum += txyz_err;
         summary.localization_z_sum += z_err;
@@ -346,10 +361,61 @@ LocalizationDetail AccumulateLocalization(const FrameData& qf,
     return detail;
 }
 
+void FinalizePrMetrics(EvaluationSummary& summary) {
+    const size_t n = std::min(summary.retrieval_scores.size(), summary.retrieval_labels.size());
+    if (n == 0) return;
+
+    constexpr int kThresholds = 1000;
+    std::vector<double> precisions(kThresholds, 0.0);
+    std::vector<double> recalls(kThresholds, 0.0);
+    std::vector<double> f1_scores(kThresholds, 0.0);
+
+    for (int i = 0; i < kThresholds; ++i) {
+        const double threshold = static_cast<double>(i) / static_cast<double>(kThresholds - 1);
+        int tp = 0;
+        int fp = 0;
+        int fn = 0;
+        for (size_t j = 0; j < n; ++j) {
+            const bool predicted = summary.retrieval_scores[j] >= threshold;
+            const bool actual = summary.retrieval_labels[j] != 0;
+            if (predicted && actual) ++tp;
+            else if (predicted && !actual) ++fp;
+            else if (!predicted && actual) ++fn;
+        }
+        const double precision = (tp + fp) > 0
+            ? static_cast<double>(tp) / static_cast<double>(tp + fp)
+            : 0.0;
+        const double recall = (tp + fn) > 0
+            ? static_cast<double>(tp) / static_cast<double>(tp + fn)
+            : 0.0;
+        precisions[i] = precision;
+        recalls[i] = recall;
+        f1_scores[i] = (precision + recall) > 0.0
+            ? 2.0 * precision * recall / (precision + recall)
+            : 0.0;
+        if ((tp + fp) > 0 && fp == 0) {
+            summary.mr = std::max(summary.mr, recall);
+        }
+    }
+
+    summary.mf1 = *std::max_element(f1_scores.begin(), f1_scores.end());
+    std::vector<int> order(kThresholds);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return recalls[a] < recalls[b];
+    });
+    for (int i = 1; i < kThresholds; ++i) {
+        const int a = order[i - 1];
+        const int b = order[i];
+        summary.auc += 0.5 * (precisions[a] + precisions[b]) * (recalls[b] - recalls[a]);
+    }
+}
+
 void Finalize(EvaluationSummary& summary) {
     summary.recall = summary.evaluated > 0
         ? static_cast<double>(summary.true_positive) / summary.evaluated
         : 0.0;
+    FinalizePrMetrics(summary);
     if (summary.evaluated > 0) {
         summary.mean_spatial_error /= summary.evaluated;
         summary.mean_overlap /= summary.evaluated;
@@ -469,14 +535,22 @@ void RunInterPair(const Config& config,
     for (size_t q = 0; q < queries.frames.size(); ++q) {
         if (test_polygons && !InTestPolygons(queries.frames[q].pose, *test_polygons)) continue;
         const auto gt = GroundTruth(queries, database, q, all_db, config);
-        if (gt.empty()) continue;
+        const bool has_gt = !gt.empty();
+        if (!has_gt) {
+            ++summary.queries_without_gt;
+            if (!config.save_pose_edges) continue;
+        }
         auto ranked = RankCandidates(queries, database, q, all_db, config);
         if (ranked.empty()) continue;
+        ++summary.ranked_queries;
         for (const auto& result : ranked) {
             const FrameData& ranked_cf =
                 database.frames.at(database.frame_to_slot.at(result.candidate_index));
-            WritePoseEdge(edge_out, queries.frames[q], ranked_cf, result);
+            if (WritePoseEdge(edge_out, queries.frames[q], ranked_cf, result)) {
+                ++summary.pose_edges_written;
+            }
         }
+        if (!has_gt) continue;
         const auto [gt_hist, gt_hash] = TopCandidateGtCounts(queries, database, q, all_db, gt, config);
         CandidateResult best = ranked.front();
         best.true_neighbor = gt.count(best.candidate_index) > 0;
@@ -486,9 +560,10 @@ void RunInterPair(const Config& config,
         if (gt_hash == 0) ++summary.zero_gt_top_hash;
         summary.mean_gt_top_histogram += gt_hist;
         if (best.true_neighbor) ++summary.true_positive;
+        AccumulateRetrieval(best, best.true_neighbor, summary);
         Accumulate(best, summary);
         const LocalizationDetail detail =
-            AccumulateLocalization(queries.frames[q], cf, best, best.true_neighbor, summary);
+            AccumulateLocalization(queries.frames[q], cf, best, best.true_neighbor, config, summary);
         if (debug && detail.valid) {
             debug << "inter," << queries.frames[q].index << "," << best.candidate_index << ","
                   << (best.true_neighbor ? 1 : 0) << "," << best.spatial_error << ","
@@ -512,6 +587,8 @@ EvaluationSummary RunIntraSession(const Config& config) {
     ThrowIfSchemaErrors(TreeCsvSchemaErrors(config.dataset_root, config.max_frames, "dataset_root"));
     Dataset dataset = LoadDataset(config.dataset_root, config, config.neighbor_past_only, config.dataset_yaw_deg);
     EvaluationSummary summary;
+    summary.localization_translation_threshold_m = config.localization_translation_threshold_m;
+    summary.localization_rotation_threshold_deg = config.localization_rotation_threshold_deg;
     summary.queries = static_cast<int>(dataset.frames.size());
     std::ofstream debug;
     if (const char* path = std::getenv("TREELOCPP_DEBUG_CSV")) {
@@ -528,22 +605,31 @@ EvaluationSummary RunIntraSession(const Config& config) {
         const auto candidates = IntraCandidates(dataset, q, config);
         if (candidates.empty()) continue;
         const auto gt = GroundTruth(dataset, dataset, q, candidates, config);
-        if (gt.empty()) continue;
+        const bool has_gt = !gt.empty();
+        if (!has_gt) {
+            ++summary.queries_without_gt;
+            if (!config.save_pose_edges) continue;
+        }
         auto ranked = RankCandidates(dataset, dataset, q, candidates, config);
         if (ranked.empty()) continue;
+        ++summary.ranked_queries;
         for (const auto& result : ranked) {
             const FrameData& ranked_cf =
                 dataset.frames.at(dataset.frame_to_slot.at(result.candidate_index));
-            WritePoseEdge(edge_out, dataset.frames[q], ranked_cf, result);
+            if (WritePoseEdge(edge_out, dataset.frames[q], ranked_cf, result)) {
+                ++summary.pose_edges_written;
+            }
         }
+        if (!has_gt) continue;
         CandidateResult best = ranked.front();
         best.true_neighbor = gt.count(best.candidate_index) > 0;
         const FrameData& cf = dataset.frames.at(dataset.frame_to_slot.at(best.candidate_index));
         ++summary.evaluated;
         if (best.true_neighbor) ++summary.true_positive;
+        AccumulateRetrieval(best, best.true_neighbor, summary);
         Accumulate(best, summary);
         const LocalizationDetail detail =
-            AccumulateLocalization(dataset.frames[q], cf, best, best.true_neighbor, summary);
+            AccumulateLocalization(dataset.frames[q], cf, best, best.true_neighbor, config, summary);
         if (debug && detail.valid) {
             debug << "intra," << dataset.frames[q].index << "," << best.candidate_index << ","
                   << (best.true_neighbor ? 1 : 0) << "," << best.spatial_error << ","
@@ -565,6 +651,8 @@ EvaluationSummary RunIntraSession(const Config& config) {
 
 EvaluationSummary RunInterSession(const Config& config) {
     EvaluationSummary summary;
+    summary.localization_translation_threshold_m = config.localization_translation_threshold_m;
+    summary.localization_rotation_threshold_deg = config.localization_rotation_threshold_deg;
     const auto query_roots = QueryRoots(config);
     const auto database_roots = DatabaseRoots(config);
     for (size_t qi = 0; qi < query_roots.size(); ++qi) {
@@ -579,38 +667,69 @@ EvaluationSummary RunInterSession(const Config& config) {
 }
 
 void PrintSummary(const EvaluationSummary& summary, std::ostream& out) {
+    auto ratio = [](int num, int den) {
+        return den > 0 ? static_cast<double>(num) / static_cast<double>(den) : 0.0;
+    };
+    auto percent = [](int num, int den) {
+        return den > 0 ? 100.0 * static_cast<double>(num) / static_cast<double>(den) : 0.0;
+    };
+
     out << std::fixed << std::setprecision(4);
     out << "Queries: " << summary.queries << "\n";
+    out << "Ranked queries: " << summary.ranked_queries << "\n";
+    out << "Queries without GT: " << summary.queries_without_gt << "\n";
+    out << "Pose edges written: " << summary.pose_edges_written << "\n";
     out << "Evaluated queries with GT: " << summary.evaluated << "\n";
-    out << "True positives: " << summary.true_positive << "\n";
-    out << "Recall@1: " << summary.recall << "\n";
+    if (summary.evaluated == 0) {
+        out << "Evaluation metrics: n/a (no GT candidates)\n";
+        return;
+    }
+
+    out << "\nRetrieval Metrics\n";
+    out << "Recall@1: " << summary.recall << " ("
+        << summary.true_positive << "/" << summary.evaluated << ")\n";
+    out << "MR: " << summary.mr << "\n";
+    out << "MF1: " << summary.mf1 << "\n";
+    out << "AUC: " << summary.auc << "\n";
     out << "Mean best spatial error: " << summary.mean_spatial_error << " m\n";
     out << "Mean best overlap: " << summary.mean_overlap << "\n";
-    out << "Mean |z offset|: " << summary.mean_z << " m\n";
-    out << "Mean |roll|: " << summary.mean_roll_deg << " deg\n";
-    out << "Mean |pitch|: " << summary.mean_pitch_deg << " deg\n";
-    out << "Localization Success@true-pairs 2D: "
-        << summary.localization_2d_true_success << "/" << summary.true_positive
-        << " (" << (summary.true_positive > 0
-            ? 100.0 * summary.localization_2d_true_success / summary.true_positive
-            : 0.0) << "%)\n";
-    out << "Mean localization |t_xy| (succ only): "
+
+    out << "\nLocalization Metrics\n";
+    out << "Thresholds: translation <= " << summary.localization_translation_threshold_m
+        << " m, rotation <= " << summary.localization_rotation_threshold_deg << " deg\n";
+    out << "R@50 2D: " << ratio(summary.localization_2d_recall_success, summary.evaluated)
+        << " (" << summary.localization_2d_recall_success << "/" << summary.evaluated
+        << ", " << percent(summary.localization_2d_recall_success, summary.evaluated) << "%)\n";
+    out << "SR 2D: " << ratio(summary.localization_2d_true_success, summary.true_positive)
+        << " (" << summary.localization_2d_true_success << "/" << summary.true_positive
+        << ", " << percent(summary.localization_2d_true_success, summary.true_positive) << "%)\n";
+    out << "ATE 2D: "
         << (summary.localization_2d_true_success > 0
             ? summary.localization_txy_sum / summary.localization_2d_true_success
             : 0.0) << " m\n";
-    out << "Mean localization |yaw_err| (succ only): "
+    out << "ARE 2D: "
         << (summary.localization_2d_true_success > 0
             ? summary.localization_yaw_sum / summary.localization_2d_true_success * 180.0 / M_PI
             : 0.0) << " deg\n";
-    out << "Localization Success@true-pairs 6DoF: "
-        << summary.localization_6d_true_success << "/" << summary.true_positive
-        << " (" << (summary.true_positive > 0
-            ? 100.0 * summary.localization_6d_true_success / summary.true_positive
-            : 0.0) << "%)\n";
-    out << "Mean localization |t_xyz| (succ only): "
+    out << "R@50 3D: " << ratio(summary.localization_6d_recall_success, summary.evaluated)
+        << " (" << summary.localization_6d_recall_success << "/" << summary.evaluated
+        << ", " << percent(summary.localization_6d_recall_success, summary.evaluated) << "%)\n";
+    out << "SR 3D: " << ratio(summary.localization_6d_true_success, summary.true_positive)
+        << " (" << summary.localization_6d_true_success << "/" << summary.true_positive
+        << ", " << percent(summary.localization_6d_true_success, summary.true_positive) << "%)\n";
+    out << "ATE 3D: "
         << (summary.localization_6d_true_success > 0
             ? summary.localization_txyz_sum / summary.localization_6d_true_success
             : 0.0) << " m\n";
+    out << "ARE 3D: "
+        << (summary.localization_6d_true_success > 0
+            ? summary.localization_rot_norm_sum / summary.localization_6d_true_success * 180.0 / M_PI
+            : 0.0) << " deg\n";
+
+    out << "\nPose Refinement Metrics\n";
+    out << "Mean |z offset|: " << summary.mean_z << " m\n";
+    out << "Mean |roll|: " << summary.mean_roll_deg << " deg\n";
+    out << "Mean |pitch|: " << summary.mean_pitch_deg << " deg\n";
     out << "Mean localization |z| (succ only): "
         << (summary.localization_6d_true_success > 0
             ? summary.localization_z_sum / summary.localization_6d_true_success

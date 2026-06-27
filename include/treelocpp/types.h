@@ -96,9 +96,19 @@ struct CandidateResult {
 
 struct EvaluationSummary {
     int queries = 0;
+    int ranked_queries = 0;
+    int queries_without_gt = 0;
+    int pose_edges_written = 0;
     int evaluated = 0;
     int true_positive = 0;
+    double localization_translation_threshold_m = 0.5;
+    double localization_rotation_threshold_deg = 5.0;
     double recall = 0.0;
+    double mr = 0.0;
+    double mf1 = 0.0;
+    double auc = 0.0;
+    std::vector<double> retrieval_scores;
+    std::vector<int> retrieval_labels;
     double mean_spatial_error = 0.0;
     double mean_overlap = 0.0;
     double mean_z = 0.0;

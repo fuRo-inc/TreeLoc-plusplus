@@ -25,7 +25,7 @@ TreeLoc++ consumes tree-level observations extracted before evaluation. The repo
 
 The bundled sample datasets correspond to:
 
-- `Wild_V01` and `Wild_V02`: Wild-Places Venman sequences. The raw dataset is available from the [Wild-Places project page](https://csiro-robotics.github.io/Wild-Places/) and [CSIRO Data Access Portal](https://data.csiro.au/collection/csiro%3A56372).
+- `Wild_V03` and `Wild_V04`: Wild-Places Venman sequences. The raw dataset is available from the [Wild-Places project page](https://csiro-robotics.github.io/Wild-Places/) and [CSIRO Data Access Portal](https://data.csiro.au/collection/csiro%3A56372).
 
 The full public release also includes Oxford Evo, Stein am Rein, Forest of Dean, Wytham, and multi-session Evo23/Evo25 sequences. The single-session Oxford raw recordings are available from the [Oxford Forest Place Recognition Dataset](https://dynamic.robots.ox.ac.uk/datasets/oxford-forest/).
 
@@ -117,24 +117,26 @@ This builds:
 The repository keeps two processed Wild-Places sample datasets under `data/`:
 
 ```text
-data/Wild_V01/
-data/Wild_V02/
+data/Wild_V03/
+data/Wild_V04/
 ```
 
 #### Intra-Session Localization
 
 ```bash
-./build/treelocpp_intra config/full_v01.yaml
-./build/treelocpp_intra config/full_v02.yaml
+./build/treelocpp_intra config/full_v03.yaml
+./build/treelocpp_intra config/full_v04.yaml
 ```
 
 #### Inter-Session Localization
 
 ```bash
-./build/treelocpp_inter config/inter_v01_v02.yaml
+./build/treelocpp_inter config/inter_v03_v04.yaml
 ```
 
-`config/inter_v01_v02.yaml` uses the Wild_V test-region family selected by `test_region_family` and a 5 m ground-truth radius.
+`config/inter_v03_v04.yaml` uses the Wild_V test-region family selected by `test_region_family` and a 5 m ground-truth radius.
+
+Both intra-session and inter-session evaluators print `Recall@1`, `MR`, `MF1`, `AUC`, and localization `R@50`, `SR`, `ATE`, and `ARE` for 2D and 3D pose estimates. `R@50` and `SR` use `evaluation.localization_translation_threshold_m` and `evaluation.localization_rotation_threshold_deg`, which default to 0.5 m and 5 deg. `SR` is the true-pair success rate, `ATE` is translation error, and `ARE` is rotation error.
 
 #### Pose-Edge Export
 
@@ -144,7 +146,7 @@ Set `pose_edges.enabled: true` in a config file to export GTSAM-compatible pose 
 q_idx db_idx overlap x y z roll pitch yaw
 ```
 
-Inter-session configs can also provide comma-separated `dataset.query_roots`, `dataset.map_roots`, `dataset.query_labels`, and `dataset.map_labels` for multi-session batch export.
+Inter-session configs can also provide comma-separated `dataset.query_roots`, `dataset.map_roots`, `dataset.query_labels`, and `dataset.map_labels` for multi-session batch export. If no GT candidate exists for a query, evaluation metrics are skipped for that query, but pose-edge export still writes ranked pairs when `pose_edges.enabled` is true.
 
 #### Graph Optimization
 
@@ -160,9 +162,9 @@ The `sessions.csv` rows are `label,slam_csv` or `label,key,slam_csv`.
 
 Main parameters are grouped by role in:
 
-- `config/full_v01.yaml` for full Wild_V01 intra-session evaluation
-- `config/full_v02.yaml` for full Wild_V02 intra-session evaluation
-- `config/inter_v01_v02.yaml` for full Wild_V01-to-Wild_V02 inter-session evaluation
+- `config/full_v03.yaml` for full Wild_V03 intra-session evaluation
+- `config/full_v04.yaml` for full Wild_V04 intra-session evaluation
+- `config/inter_v03_v04.yaml` for full Wild_V03-to-Wild_V04 inter-session evaluation
 
 Each YAML file includes inline comments for the exposed parameters.
 
