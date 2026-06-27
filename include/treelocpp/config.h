@@ -78,6 +78,7 @@ struct Config {
 
     bool use_dbh_triangle_match = true;
     double dbh_diff_tol = 0.2;
+    double refine_distance_tol = 0.4;
     double match_distance_tol = 0.4;
 
     bool use_vertical = true;

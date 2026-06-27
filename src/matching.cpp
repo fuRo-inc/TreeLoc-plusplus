@@ -238,13 +238,33 @@ bool Rigid2D(const std::vector<Eigen::Vector2d>& q,
     return true;
 }
 
+bool RigidTriangleNoReflection(const std::array<Eigen::Vector2d, 3>& q,
+                               const std::array<Eigen::Vector2d, 3>& c,
+                               Eigen::Matrix2d& R,
+                               Eigen::Vector2d& t) {
+    Eigen::Matrix<double, 3, 2> Q;
+    Eigen::Matrix<double, 3, 2> C;
+    for (int i = 0; i < 3; ++i) {
+        Q.row(i) = q[i];
+        C.row(i) = c[i];
+    }
+    const Eigen::Vector2d qc = Q.colwise().mean();
+    const Eigen::Vector2d cc = C.colwise().mean();
+    const Eigen::Matrix<double, 3, 2> q0 = Q.rowwise() - qc.transpose();
+    const Eigen::Matrix<double, 3, 2> c0 = C.rowwise() - cc.transpose();
+    const Eigen::Matrix2d H = q0.transpose() * c0;
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    R = svd.matrixV() * svd.matrixU().transpose();
+    if (R.determinant() < 0.0) return false;
+    t = cc - R * qc;
+    return true;
+}
+
 double TriangleResidual(const std::array<Eigen::Vector2d, 3>& q,
                         const std::array<Eigen::Vector2d, 3>& c) {
-    std::vector<Eigen::Vector2d> qv(q.begin(), q.end());
-    std::vector<Eigen::Vector2d> cv(c.begin(), c.end());
     Eigen::Matrix2d R;
     Eigen::Vector2d t;
-    if (!Rigid2D(qv, cv, R, t)) return std::numeric_limits<double>::infinity();
+    if (!RigidTriangleNoReflection(q, c, R, t)) return std::numeric_limits<double>::infinity();
     double err = 0.0;
     for (int i = 0; i < 3; ++i) err += (R * q[i] + t - c[i]).norm();
     return err / 3.0;
@@ -603,23 +623,27 @@ Transform2D EstimateTransform2D(const FrameData& query,
         for (int k = 0; k < 3; ++k) {
             qv.push_back(query.centers[qt[k]]);
             cv.push_back(candidate.centers[ct[perm[k]]]);
-            tri_pairs.push_back({qt[k], ct[perm[k]]});
         }
         Eigen::Matrix2d R;
         Eigen::Vector2d t;
-        if (Rigid2D(qv, cv, R, t)) {
+        std::array<Eigen::Vector2d, 3> qarr{qv[0], qv[1], qv[2]};
+        std::array<Eigen::Vector2d, 3> carr{cv[0], cv[1], cv[2]};
+        if (RigidTriangleNoReflection(qarr, carr, R, t)) {
             tri_yaws.push_back(RotationYaw(R));
             q_centers.push_back((qv[0] + qv[1] + qv[2]) / 3.0);
             c_centers.push_back((cv[0] + cv[1] + cv[2]) / 3.0);
+            for (int k = 0; k < 3; ++k) {
+                tri_pairs.push_back({qt[k], ct[perm[k]]});
+            }
         }
     };
 
-    for (const auto& kv : q_groups) {
-        auto cit = c_groups.find(kv.first);
-        if (cit == c_groups.end()) continue;
-        const auto& q_list = kv.second;
-        const auto& c_list = cit->second;
-        if (config.use_dbh_triangle_match) {
+    if (config.use_dbh_triangle_match) {
+        for (const auto& kv : q_groups) {
+            auto cit = c_groups.find(kv.first);
+            if (cit == c_groups.end()) continue;
+            const auto& q_list = kv.second;
+            const auto& c_list = cit->second;
             if (q_list.size() == 1 && c_list.size() == 1) {
                 std::array<int, 3> perm{0, 1, 2};
                 if (best_perm_residual(query.triangles.simplices[q_list[0]],
@@ -658,14 +682,23 @@ Transform2D EstimateTransform2D(const FrameData& query,
                 if (it == best_perm.end()) continue;
                 add_triangle(q_list[r], c_list[c], it->second);
             }
-        } else {
-            for (int qti : q_list) {
-                for (int cti : c_list) {
-                    std::array<int, 3> perm{0, 1, 2};
-                    if (best_perm_residual(query.triangles.simplices[qti], candidate.triangles.simplices[cti], perm)) {
-                        add_triangle(qti, cti, perm);
-                    }
-                }
+        }
+    } else {
+        std::unordered_map<long long, int> q_single;
+        std::unordered_map<long long, int> c_single;
+        for (const auto& item : query.hashes) q_single[item.first] = item.second;
+        for (const auto& item : candidate.hashes) c_single[item.first] = item.second;
+        std::vector<long long> commons;
+        for (const auto& kv_single : q_single) {
+            if (c_single.find(kv_single.first) != c_single.end()) commons.push_back(kv_single.first);
+        }
+        std::sort(commons.begin(), commons.end());
+        for (long long hash : commons) {
+            const int qti = q_single[hash];
+            const int cti = c_single[hash];
+            std::array<int, 3> perm{0, 1, 2};
+            if (best_perm_residual(query.triangles.simplices[qti], candidate.triangles.simplices[cti], perm)) {
+                add_triangle(qti, cti, perm);
             }
         }
     }
@@ -734,7 +767,7 @@ Transform2D EstimateTransform2D(const FrameData& query,
     for (int ci = 0; ci < static_cast<int>(candidate.trees.size()); ++ci) {
         const Eigen::Vector2d cp(candidate.trees[ci].x, candidate.trees[ci].y);
         double dist = 0.0;
-        const int qi = NearestQuery(query, R, t, cp, config.match_distance_tol, &dist);
+        const int qi = NearestQuery(query, R, t, cp, config.refine_distance_tol, &dist);
         if (qi >= 0) {
             refine_q.emplace_back(query.trees[qi].x, query.trees[qi].y);
             refine_c.push_back(cp);
@@ -756,7 +789,7 @@ Transform2D EstimateTransform2D(const FrameData& query,
     out.t = t;
     out.pairs = std::move(matches);
     out.overlap = OverlapScore(query, candidate, out.pairs) * TPenalty(t, config);
-    out.ok = out.pairs.size() >= 2;
+    out.ok = true;
     return out;
 }
 

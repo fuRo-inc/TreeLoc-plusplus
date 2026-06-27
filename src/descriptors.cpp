@@ -2,11 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <Eigen/Eigenvalues>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <set>
-#include <unordered_set>
 
 #include "treelocpp/geometry.h"
 #include "treelocpp/io.h"
@@ -44,21 +44,57 @@ std::vector<int> NeighborFrames(int idx,
     return out;
 }
 
-std::vector<Tree> Deduplicate(const std::vector<Tree>& trees, double tol) {
-    if (tol <= 0.0) return trees;
+bool HasNearbyTree(const std::vector<Tree>& trees, const Tree& tree, double tol) {
+    if (tol <= 0.0) return false;
     const double tol2 = tol * tol;
-    std::vector<Tree> out;
-    std::vector<char> used(trees.size(), 0);
-    for (size_t i = 0; i < trees.size(); ++i) {
-        if (used[i]) continue;
-        out.push_back(trees[i]);
-        for (size_t j = i + 1; j < trees.size(); ++j) {
-            const double dx = trees[i].x - trees[j].x;
-            const double dy = trees[i].y - trees[j].y;
-            if (dx * dx + dy * dy <= tol2) used[j] = 1;
-        }
+    for (const auto& existing : trees) {
+        const double dx = existing.x - tree.x;
+        const double dy = existing.y - tree.y;
+        if (dx * dx + dy * dy <= tol2) return true;
+    }
+    return false;
+}
+
+void AppendNonDuplicates(std::vector<Tree>& base,
+                         const std::vector<Tree>& additions,
+                         double tol) {
+    for (const auto& tree : additions) {
+        if (!std::isfinite(tree.x) || !std::isfinite(tree.y)) continue;
+        if (HasNearbyTree(base, tree, tol)) continue;
+        base.push_back(tree);
+    }
+}
+
+void AppendNonDuplicatesUntil(std::vector<Tree>& base,
+                              const std::vector<Tree>& additions,
+                              double tol,
+                              int max_size) {
+    for (const auto& tree : additions) {
+        if (max_size > 0 && static_cast<int>(base.size()) >= max_size) break;
+        if (!std::isfinite(tree.x) || !std::isfinite(tree.y)) continue;
+        if (HasNearbyTree(base, tree, tol)) continue;
+        base.push_back(tree);
+    }
+}
+
+std::vector<Tree> MoveTreesToFrame(const std::vector<Tree>& trees,
+                                   const Pose& src,
+                                   const Pose& dst) {
+    std::vector<Eigen::Vector2d> pts;
+    pts.reserve(trees.size());
+    for (const auto& tree : trees) pts.emplace_back(tree.x, tree.y);
+    Eigen::MatrixXd moved = LocalToLocal2D(pts, src, dst);
+    std::vector<Tree> out = trees;
+    for (int i = 0; i < static_cast<int>(out.size()); ++i) {
+        out[i].x = moved(i, 0);
+        out[i].y = moved(i, 1);
     }
     return out;
+}
+
+void SortByScoreDesc(std::vector<Tree>& trees) {
+    std::sort(trees.begin(), trees.end(),
+              [](const Tree& a, const Tree& b) { return a.score > b.score; });
 }
 
 void ApplyTransform(std::vector<Tree>& trees, const Eigen::Matrix4d& T) {
@@ -73,37 +109,50 @@ void ApplyTransform(std::vector<Tree>& trees, const Eigen::Matrix4d& T) {
     }
 }
 
-Eigen::Matrix4d AxisAlignment(const std::vector<Tree>& trees) {
-    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-    int count = 0;
+Eigen::Matrix4d RotationFromAxisToUp(const Eigen::Vector3d& axis) {
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    if (!axis.allFinite() || axis.norm() < 1e-6) return T;
+    Eigen::Vector3d u = axis.normalized();
+    if (u.z() < 0.0) u = -u;
+    const Eigen::Vector3d target(0.0, 0.0, 1.0);
+    const double c = std::clamp(u.dot(target), -1.0, 1.0);
+    if (std::abs(c - 1.0) < 1e-9) return T;
+    if (std::abs(c + 1.0) < 1e-9) {
+        T(0, 0) = -1.0;
+        T(2, 2) = -1.0;
+        return T;
+    }
+    T.block<3, 3>(0, 0) = Eigen::Quaterniond::FromTwoVectors(u, target).toRotationMatrix();
+    return T;
+}
+
+Eigen::Matrix4d ScatterAxisAlignment(const std::vector<Tree>& trees) {
+    Eigen::Matrix3d scatter = Eigen::Matrix3d::Zero();
+    std::vector<Eigen::Vector3d> axes;
+    axes.reserve(trees.size());
     for (const auto& tree : trees) {
         if (!tree.has_axis) continue;
         Eigen::Vector3d axis(tree.axis(0, 2), tree.axis(1, 2), tree.axis(2, 2));
         if (!axis.allFinite() || axis.norm() < 1e-6) continue;
         axis.normalize();
-        mean += axis;
-        ++count;
+        axes.push_back(axis);
+        scatter.noalias() += axis * axis.transpose();
     }
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    if (count == 0 || mean.norm() < 1e-6) return T;
-    mean.normalize();
-    if (mean.z() < 0.0) mean = -mean;
-    const Eigen::Vector3d target(0.0, 0.0, 1.0);
-    const double c = std::clamp(mean.dot(target), -1.0, 1.0);
-    if (std::abs(c - 1.0) < 1e-6) return T;
-    if (std::abs(c + 1.0) < 1e-6) {
-        T(0, 0) = -1.0;
-        T(2, 2) = -1.0;
-        return T;
+    if (axes.size() < 2) return Eigen::Matrix4d::Identity();
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(scatter);
+    if (es.info() != Eigen::Success) return Eigen::Matrix4d::Identity();
+    Eigen::Vector3d axis = es.eigenvectors().col(2);
+    int positive = 0;
+    int negative = 0;
+    double sum_dot = 0.0;
+    for (const auto& item : axes) {
+        const double dot = item.dot(axis);
+        sum_dot += dot;
+        if (dot >= 0.0) ++positive;
+        else ++negative;
     }
-    const Eigen::Vector3d v = mean.cross(target);
-    const double s = v.norm();
-    Eigen::Matrix3d vx;
-    vx << 0.0, -v.z(), v.y(),
-          v.z(), 0.0, -v.x(),
-          -v.y(), v.x(), 0.0;
-    T.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() + vx + vx * vx * ((1.0 - c) / (s * s));
-    return T;
+    if (negative > positive || (negative == positive && sum_dot < 0.0)) axis = -axis;
+    return RotationFromAxisToUp(axis);
 }
 
 Eigen::Matrix4d ApplyFrameAlignment(std::vector<Tree>& trees,
@@ -116,7 +165,7 @@ Eigen::Matrix4d ApplyFrameAlignment(std::vector<Tree>& trees,
         if (tree.number_clusters > 2) align_rows.push_back(tree);
     }
     if (config.tree_axis_alignment_enabled && align_rows.size() >= 3) {
-        Eigen::Matrix4d T = AxisAlignment(align_rows);
+        Eigen::Matrix4d T = ScatterAxisAlignment(align_rows);
         ApplyTransform(trees, T);
         total = T * total;
     }
@@ -143,9 +192,17 @@ FrameData BuildFrame(const std::filesystem::path& root,
 
     std::vector<Tree> reconstructed;
     std::vector<Tree> supplemental;
+    std::vector<Tree> supplemental_gt2;
+    std::vector<Tree> supplemental_eq2;
+    std::vector<Tree> supplemental_other;
     for (const auto& tree : current) {
         if (tree.reconstructed == 1) reconstructed.push_back(tree);
-        else if (tree.score > config.tree_score_min) supplemental.push_back(tree);
+        else if (tree.score > config.tree_score_min) {
+            supplemental.push_back(tree);
+            if (tree.number_clusters > 2) supplemental_gt2.push_back(tree);
+            else if (tree.number_clusters == 2) supplemental_eq2.push_back(tree);
+            else supplemental_other.push_back(tree);
+        }
     }
 
     if (config.neighbor_augment &&
@@ -153,32 +210,56 @@ FrameData BuildFrame(const std::filesystem::path& root,
         for (int neighbor : NeighborFrames(idx, trajectory, config, past_only)) {
             if (!HasFrameCsv(root, neighbor)) continue;
             std::vector<Tree> nb = ReadTreeCsv(root / ("TreeManagerState_" + std::to_string(neighbor) + ".csv"));
-            std::vector<Eigen::Vector2d> nb_pts;
             std::vector<Tree> nb_rec;
             for (const auto& tree : nb) {
                 if (tree.reconstructed != 1 || !InLocalBox(tree, config)) continue;
                 nb_rec.push_back(tree);
-                nb_pts.emplace_back(tree.x, tree.y);
             }
             if (nb_rec.empty() || neighbor >= static_cast<int>(trajectory.size())) continue;
-            Eigen::MatrixXd moved = LocalToLocal2D(nb_pts, trajectory[neighbor], trajectory[idx]);
-            for (int i = 0; i < static_cast<int>(nb_rec.size()); ++i) {
-                Tree t = nb_rec[i];
-                t.x = moved(i, 0);
-                t.y = moved(i, 1);
-                reconstructed.push_back(t);
-            }
+            const std::vector<Tree> moved = MoveTreesToFrame(nb_rec, trajectory[neighbor], trajectory[idx]);
+            AppendNonDuplicates(reconstructed, moved, config.dedup_distance);
             if (static_cast<int>(reconstructed.size()) >= config.min_reconstructed_per_frame) break;
         }
-        reconstructed = Deduplicate(reconstructed, config.dedup_distance);
     }
 
     frame.trees = reconstructed;
-    const int need = config.number_of_cluster - static_cast<int>(frame.trees.size());
-    if (need > 0) {
+    SortByScoreDesc(supplemental_gt2);
+    AppendNonDuplicatesUntil(frame.trees, supplemental_gt2, config.dedup_distance, config.number_of_cluster);
+    if (static_cast<int>(frame.trees.size()) < config.number_of_cluster) {
+        SortByScoreDesc(supplemental_eq2);
+        AppendNonDuplicatesUntil(frame.trees, supplemental_eq2, config.dedup_distance, config.number_of_cluster);
+    }
+    if (static_cast<int>(frame.trees.size()) < config.number_of_cluster) {
+        SortByScoreDesc(supplemental_other);
+        AppendNonDuplicatesUntil(frame.trees, supplemental_other, config.dedup_distance, config.number_of_cluster);
+    }
+    if (config.neighbor_augment && static_cast<int>(frame.trees.size()) < config.number_of_cluster) {
+        for (int neighbor : NeighborFrames(idx, trajectory, config, past_only)) {
+            if (static_cast<int>(frame.trees.size()) >= config.number_of_cluster) break;
+            if (!HasFrameCsv(root, neighbor) || neighbor >= static_cast<int>(trajectory.size())) continue;
+            std::vector<Tree> nb = ReadTreeCsv(root / ("TreeManagerState_" + std::to_string(neighbor) + ".csv"));
+            std::vector<Tree> nb_add;
+            nb_add.reserve(nb.size());
+            for (const auto& tree : nb) {
+                if (tree.reconstructed == 1 || tree.score <= config.tree_score_min || !InLocalBox(tree, config)) continue;
+                nb_add.push_back(tree);
+            }
+            if (nb_add.empty()) continue;
+            std::vector<Tree> moved = MoveTreesToFrame(nb_add, trajectory[neighbor], trajectory[idx]);
+            std::vector<Tree> moved_box;
+            moved_box.reserve(moved.size());
+            for (const auto& tree : moved) {
+                if (InLocalBox(tree, config)) moved_box.push_back(tree);
+            }
+            SortByScoreDesc(moved_box);
+            AppendNonDuplicatesUntil(frame.trees, moved_box, config.dedup_distance, config.number_of_cluster);
+        }
+    }
+
+    if (frame.trees.empty()) {
         std::sort(supplemental.begin(), supplemental.end(),
                   [](const Tree& a, const Tree& b) { return a.score > b.score; });
-        for (int i = 0; i < need && i < static_cast<int>(supplemental.size()); ++i) {
+        for (int i = 0; i < config.number_of_cluster && i < static_cast<int>(supplemental.size()); ++i) {
             frame.trees.push_back(supplemental[i]);
         }
     }

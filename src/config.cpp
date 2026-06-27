@@ -183,6 +183,7 @@ void Assign(const std::string& key, const std::string& value, Config& config, si
     else if (IsKey(normalized, {"yaw_min_tri_inliers", "yaw_voting.min_triangle_inliers"})) config.yaw_min_tri_inliers = ParseNumber<int>(value, normalized, line_no);
     else if (IsKey(normalized, {"use_dbh_triangle_match", "dbh_matching.enabled"})) config.use_dbh_triangle_match = ParseBool(value, normalized, line_no);
     else if (IsKey(normalized, {"dbh_diff_tol", "dbh_matching.difference_tolerance_m"})) config.dbh_diff_tol = ParseNumber<double>(value, normalized, line_no);
+    else if (IsKey(normalized, {"refine_distance_tol", "dbh_matching.refine_distance_tolerance_m"})) config.refine_distance_tol = ParseNumber<double>(value, normalized, line_no);
     else if (IsKey(normalized, {"match_distance_tol", "dbh_matching.match_distance_tolerance_m"})) config.match_distance_tol = ParseNumber<double>(value, normalized, line_no);
     else if (IsKey(normalized, {"use_vertical", "pose_refinement.enabled"})) config.use_vertical = ParseBool(value, normalized, line_no);
     else if (IsKey(normalized, {"vertical_ransac_iters", "pose_refinement.ransac_iterations"})) config.vertical_ransac_iters = ParseNumber<int>(value, normalized, line_no);
@@ -268,6 +269,8 @@ bool ValidateConfig(const Config& config, std::string* error) {
     if (config.total_section <= 0 || config.bin_width <= 0.0) return fail("radius bins are invalid");
     if (config.pdh_bins <= 0) return fail("pdh_bins must be positive");
     if (config.pdh_max_dist <= config.pdh_min_dist) return fail("pdh distance range is invalid");
+    if (config.refine_distance_tol <= 0.0) return fail("refine_distance_tol must be positive");
+    if (config.match_distance_tol <= 0.0) return fail("match_distance_tol must be positive");
     if (config.spatial_range_bins.empty()) return fail("spatial bins are empty");
     if (!config.query_labels.empty() && !config.query_roots.empty() &&
         config.query_labels.size() != config.query_roots.size()) {
