@@ -5,7 +5,8 @@
 Official repository for **TreeLoc++**.
 
 <a href="https://arxiv.org/abs/2603.03695" target="_blank">Paper</a> |
-<a href="https://github.com/minwoo0611/TreeLoc" target="_blank">TreeLoc</a>
+<a href="https://github.com/minwoo0611/TreeLoc" target="_blank">TreeLoc</a> |
+<a href="https://drive.google.com/drive/folders/1O0d3Xg3oDdF0GC7BhcHZsiglNQmsUBNn?usp=sharing" target="_blank">Dataset</a>
 
 </div>
 
@@ -54,6 +55,33 @@ Optional columns used when available:
 - `reconstructed`
 - `number_clusters`
 - `score` or `scores`
+
+### Public Dataset Download
+
+The public processed TreeLoc++ dataset is available on [Google Drive](https://drive.google.com/drive/folders/1O0d3Xg3oDdF0GC7BhcHZsiglNQmsUBNn?usp=sharing). It is organized as:
+
+```text
+TreeLoc++_Dataset/
+├── Oxford/
+│   ├── Evo/
+│   ├── Stein am Rein/
+│   ├── Forest of Dean/
+│   ├── Wytham/
+│   ├── Evo23_00/ ... Evo23_05/
+│   └── Evo25_00/ ... Evo25_08/
+└── Wild-Places/
+    ├── V-01/ ... V-04/
+    └── K-01/ ... K-04/
+```
+
+Each sequence folder contains:
+
+- `PCD_downsampled_0.1.zip`: downsampled LiDAR frames under `downsampled_0.1/`.
+- `tree_information.zip`: per-frame tree-level CSV files.
+
+Single-session sequences also provide `groundtruth.txt`. Multi-session Evo23/Evo25 sequences provide `initial_slam_results.csv` and `optimized.txt` for SLAM initialization and optimized trajectory references.
+
+The small sample datasets kept under `data/` are for quick local evaluation. Use the Google Drive dataset for the full Oxford and Wild-Places release.
 
 ### Prerequisites
 
@@ -153,8 +181,7 @@ The YAML files use sections such as `dataset`, `evaluation`, `retrieval`, `tree_
 
 ### TODO
 
-- Multi-session Dataset (Evo25) upload
-- Remaining dataset upload
+- Multi-session Graph Optimization
 
 ### Acknowledgement
 
