@@ -32,6 +32,9 @@ target_link_libraries(treelocpp_inter PRIVATE treelocpp)
 add_executable(treelocpp_localize apps/localize.cpp)
 target_link_libraries(treelocpp_localize PRIVATE treelocpp)
 
+add_executable(treelocpp_localize_external apps/localize_external.cpp)
+target_link_libraries(treelocpp_localize_external PRIVATE treelocpp)
+
 find_package(GTSAM QUIET)
 if(NOT GTSAM_FOUND)
     find_package(gtsam QUIET)
