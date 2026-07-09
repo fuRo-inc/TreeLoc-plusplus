@@ -1,9 +1,10 @@
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,97 +17,188 @@
 #include "treelocpp/matching.h"
 #include "treelocpp/types.h"
 
-namespace treelocpp {
 namespace {
 
 struct Args {
     std::filesystem::path config_path;
+
+    // Intra-dataset mode. This preserves the previous localize.cpp workflow.
+    int query_idx = -1;
+    int prior_idx = -1;
+    bool exclude_self = false;
+
+    // External-query mode. Use query/current against a database DFI root.
     std::filesystem::path query_root;
     std::filesystem::path database_root;
     double prior_x = 0.0;
     double prior_y = 0.0;
     double prior_yaw = 0.0;
-    bool has_prior = false;
-    double search_radius = 30.0;
+    bool has_prior_pose = false;
+
+    double search_radius_m = 30.0;
     int top_k = 10;
+    double prior_gate_xy_m = 3.0;
+    double prior_gate_yaw_rad = 0.3;
+
     double min_overlap = 0.10;
     int min_pairs = 3;
     double max_rel_z = 3.0;
     double max_rel_roll = 0.3;
     double max_rel_pitch = 0.3;
-    double max_rel_yaw = 0.7;
-    double prior_gate_xy = 10.0;
-    double prior_gate_yaw = 0.7;
+    double max_rel_yaw = 0.5;
 };
 
-[[noreturn]] void Usage(const char* argv0) {
+void PrintUsage(const char* argv0) {
     std::cerr
-        << "Usage:\n"
-        << "  " << argv0 << " CONFIG.yaml "
+        << "Usage: intra dataset mode\n"
+        << "  " << argv0 << " CONFIG "
+        << "--query_idx N "
+        << "[--prior_idx N] "
+        << "[--search_radius M] "
+        << "[--top_k K] "
+        << "[--prior_gate_xy M] "
+        << "[--prior_gate_yaw RAD] "
+        << "[--exclude_self]\n\n"
+        << "Example:\n"
+        << "  " << argv0 << " config/furo_relaxed_intra.yaml "
+        << "--query_idx 541 --prior_idx 541 --search_radius 30 --top_k 20\n\n"
+        << "Usage: external query mode\n"
+        << "  " << argv0 << " CONFIG "
+        << "--query_root query/current "
+        << "--database_root data/furo_relaxed "
+        << "--prior_x X --prior_y Y --prior_yaw RAD "
+        << "[--search_radius M] "
+        << "[--top_k K] "
+        << "[--prior_gate_xy M] "
+        << "[--prior_gate_yaw RAD]\n\n"
+        << "Example:\n"
+        << "  " << argv0 << " config/furo_relaxed_intra.yaml "
         << "--query_root query/current --database_root data/furo_relaxed "
-        << "--prior_x X --prior_y Y --prior_yaw YAW [options]\n\n"
-        << "Options:\n"
-        << "  --search_radius M      Candidate anchor radius around prior. Default: 30\n"
-        << "  --top_k N              Number of ranked rows to print. Default: 10\n"
-        << "  --min_overlap V        Acceptance gate. Default: 0.10\n"
-        << "  --min_pairs N          Acceptance gate. Default: 3\n"
-        << "  --prior_gate_xy M      Acceptance gate. Default: 10\n"
-        << "  --prior_gate_yaw RAD   Acceptance gate. Default: 0.7\n"
-        << "  --max_rel_z M          Relative transform gate. Default: 3\n"
-        << "  --max_rel_roll RAD     Relative transform gate. Default: 0.3\n"
-        << "  --max_rel_pitch RAD    Relative transform gate. Default: 0.3\n"
-        << "  --max_rel_yaw RAD      Relative transform gate. Default: 0.7\n";
-    throw std::runtime_error("invalid arguments");
+        << "--prior_x -670.165747430 --prior_y -26.559006413 --prior_yaw 1.878 "
+        << "--search_radius 30 --top_k 10 --prior_gate_xy 10 --prior_gate_yaw 0.7\n";
 }
 
 Args ParseArgs(int argc, char** argv) {
-    if (argc < 2) Usage(argv[0]);
+    if (argc < 2) {
+        PrintUsage(argv[0]);
+        throw std::runtime_error("missing config path");
+    }
+
     Args args;
     args.config_path = argv[1];
+
     for (int i = 2; i < argc; ++i) {
         const std::string key = argv[i];
-        auto need = [&](const std::string& name) -> std::string {
-            if (i + 1 >= argc) throw std::runtime_error("missing value for " + name);
+
+        auto need_value = [&](const std::string& name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for " + name);
+            }
             return argv[++i];
         };
-        if (key == "--query_root") args.query_root = need(key);
-        else if (key == "--database_root") args.database_root = need(key);
-        else if (key == "--prior_x") { args.prior_x = std::stod(need(key)); args.has_prior = true; }
-        else if (key == "--prior_y") { args.prior_y = std::stod(need(key)); args.has_prior = true; }
-        else if (key == "--prior_yaw") { args.prior_yaw = std::stod(need(key)); args.has_prior = true; }
-        else if (key == "--search_radius") args.search_radius = std::stod(need(key));
-        else if (key == "--top_k") args.top_k = std::stoi(need(key));
-        else if (key == "--min_overlap") args.min_overlap = std::stod(need(key));
-        else if (key == "--min_pairs") args.min_pairs = std::stoi(need(key));
-        else if (key == "--prior_gate_xy") args.prior_gate_xy = std::stod(need(key));
-        else if (key == "--prior_gate_yaw") args.prior_gate_yaw = std::stod(need(key));
-        else if (key == "--max_rel_z") args.max_rel_z = std::stod(need(key));
-        else if (key == "--max_rel_roll") args.max_rel_roll = std::stod(need(key));
-        else if (key == "--max_rel_pitch") args.max_rel_pitch = std::stod(need(key));
-        else if (key == "--max_rel_yaw") args.max_rel_yaw = std::stod(need(key));
-        else Usage(argv[0]);
+
+        if (key == "--query_idx") {
+            args.query_idx = std::stoi(need_value(key));
+        } else if (key == "--prior_idx") {
+            args.prior_idx = std::stoi(need_value(key));
+        } else if (key == "--query_root") {
+            args.query_root = need_value(key);
+        } else if (key == "--database_root") {
+            args.database_root = need_value(key);
+        } else if (key == "--prior_x") {
+            args.prior_x = std::stod(need_value(key));
+            args.has_prior_pose = true;
+        } else if (key == "--prior_y") {
+            args.prior_y = std::stod(need_value(key));
+            args.has_prior_pose = true;
+        } else if (key == "--prior_yaw") {
+            args.prior_yaw = std::stod(need_value(key));
+            args.has_prior_pose = true;
+        } else if (key == "--search_radius") {
+            args.search_radius_m = std::stod(need_value(key));
+        } else if (key == "--top_k") {
+            args.top_k = std::stoi(need_value(key));
+        } else if (key == "--exclude_self") {
+            args.exclude_self = true;
+        } else if (key == "--prior_gate_xy") {
+            args.prior_gate_xy_m = std::stod(need_value(key));
+        } else if (key == "--prior_gate_yaw" || key == "--prior_gate_yaw_rad") {
+            args.prior_gate_yaw_rad = std::stod(need_value(key));
+        } else if (key == "--min_overlap") {
+            args.min_overlap = std::stod(need_value(key));
+        } else if (key == "--min_pairs") {
+            args.min_pairs = std::stoi(need_value(key));
+        } else if (key == "--max_rel_z") {
+            args.max_rel_z = std::stod(need_value(key));
+        } else if (key == "--max_rel_roll") {
+            args.max_rel_roll = std::stod(need_value(key));
+        } else if (key == "--max_rel_pitch") {
+            args.max_rel_pitch = std::stod(need_value(key));
+        } else if (key == "--max_rel_yaw") {
+            args.max_rel_yaw = std::stod(need_value(key));
+        } else {
+            throw std::runtime_error("unknown argument: " + key);
+        }
     }
-    if (args.query_root.empty()) throw std::runtime_error("--query_root is required");
-    if (!args.has_prior) throw std::runtime_error("--prior_x/--prior_y/--prior_yaw are required");
+
+    const bool external_mode = !args.query_root.empty();
+    if (external_mode) {
+        if (args.database_root.empty()) {
+            throw std::runtime_error("--database_root is required when --query_root is used");
+        }
+        if (!args.has_prior_pose) {
+            throw std::runtime_error("--prior_x, --prior_y, and --prior_yaw are required when --query_root is used");
+        }
+    } else {
+        if (args.query_idx < 0) {
+            throw std::runtime_error("--query_idx is required when --query_root is not used");
+        }
+        if (args.prior_idx < 0) {
+            args.prior_idx = args.query_idx;
+        }
+    }
+
+    if (args.search_radius_m <= 0.0) throw std::runtime_error("--search_radius must be positive");
+    if (args.top_k <= 0) throw std::runtime_error("--top_k must be positive");
+    if (args.prior_gate_xy_m <= 0.0) throw std::runtime_error("--prior_gate_xy must be positive");
+    if (args.prior_gate_yaw_rad <= 0.0) throw std::runtime_error("--prior_gate_yaw must be positive");
     return args;
 }
 
-Eigen::Matrix4d PredictedRelativeTransform(const FrameData& qf,
-                                           const FrameData& cf,
-                                           const CandidateResult& best) {
+size_t SlotOf(const treelocpp::Dataset& dataset, int frame_idx, const std::string& label) {
+    const auto it = dataset.frame_to_slot.find(frame_idx);
+    if (it == dataset.frame_to_slot.end()) {
+        throw std::runtime_error(label + " frame index not found: " + std::to_string(frame_idx));
+    }
+    return it->second;
+}
+
+double PoseDistanceXYLocal(const treelocpp::Pose& a, const treelocpp::Pose& b) {
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+Eigen::Matrix4d PredictedRelativeTransform(const treelocpp::FrameData& qf,
+                                           const treelocpp::FrameData& cf,
+                                           const treelocpp::CandidateResult& best) {
     Eigen::Matrix3d Rz_q2c = Eigen::Matrix3d::Identity();
     Rz_q2c.block<2, 2>(0, 0) = best.transform.R;
+
     const Eigen::Matrix3d R_rp_q2c =
         Eigen::AngleAxisd(best.vertical.axis_pitch, Eigen::Vector3d::UnitY()).toRotationMatrix() *
         Eigen::AngleAxisd(best.vertical.axis_roll, Eigen::Vector3d::UnitX()).toRotationMatrix();
+
     const Eigen::Matrix3d R_q2c = Rz_q2c * R_rp_q2c;
     const Eigen::Vector3d t_q2c(best.transform.t.x(), best.transform.t.y(), 0.0);
 
     Eigen::Matrix3d R_c2q = R_q2c.transpose();
     Eigen::Vector3d t_c2q = -R_c2q * t_q2c;
+
     const Eigen::Matrix3d delta_r_c2q =
         Eigen::AngleAxisd(best.vertical.pitch, Eigen::Vector3d::UnitY()).toRotationMatrix() *
         Eigen::AngleAxisd(best.vertical.roll, Eigen::Vector3d::UnitX()).toRotationMatrix();
+
     R_c2q = delta_r_c2q * R_c2q;
     t_c2q += Eigen::Vector3d(0.0, 0.0, best.vertical.z);
 
@@ -117,130 +209,286 @@ Eigen::Matrix4d PredictedRelativeTransform(const FrameData& qf,
     return qf.alignment_transform.inverse() * T_pred_aligned * cf.alignment_transform;
 }
 
-std::vector<size_t> PriorCandidates(const Dataset& database, const Args& args) {
-    std::vector<size_t> out;
-    const double r2 = args.search_radius * args.search_radius;
-    for (size_t i = 0; i < database.frames.size(); ++i) {
-        const Pose& p = database.frames[i].pose;
-        const double dx = p.x - args.prior_x;
-        const double dy = p.y - args.prior_y;
-        if (dx * dx + dy * dy <= r2) out.push_back(i);
-    }
-    return out;
+double YawFromTransform(const Eigen::Matrix4d& T) {
+    double roll = 0.0;
+    double pitch = 0.0;
+    double yaw = 0.0;
+    treelocpp::EulerZYX(T.block<3, 3>(0, 0), roll, pitch, yaw);
+    return yaw;
 }
 
-std::string RejectReason(const CandidateResult& r,
-                         double rel_z,
-                         double rel_roll,
-                         double rel_pitch,
-                         double rel_yaw,
-                         double prior_err_xy,
-                         double prior_err_yaw,
-                         const Args& args) {
-    if (!r.transform.ok) return "transform_not_ok";
-    if (r.transform.overlap < args.min_overlap) return "low_overlap";
-    if (static_cast<int>(r.transform.pairs.size()) < args.min_pairs) return "few_pairs";
-    if (std::abs(rel_z) > args.max_rel_z) return "bad_rel_z";
-    if (std::abs(rel_roll) > args.max_rel_roll) return "bad_rel_roll";
-    if (std::abs(rel_pitch) > args.max_rel_pitch) return "bad_rel_pitch";
-    if (std::abs(rel_yaw) > args.max_rel_yaw) return "bad_rel_yaw";
-    if (prior_err_xy > args.prior_gate_xy) return "bad_prior_xy";
-    if (prior_err_yaw > args.prior_gate_yaw) return "bad_prior_yaw";
-    return "ok";
+struct GateResult {
+    bool accepted = false;
+    std::string reason = "unknown";
+};
+
+GateResult CheckGate(const treelocpp::CandidateResult& res,
+                     const Eigen::Vector3d& rel_t,
+                     double rel_roll,
+                     double rel_pitch,
+                     double rel_yaw,
+                     double prior_err_xy,
+                     double prior_err_yaw,
+                     const Args& args) {
+    if (!res.transform.ok) return {false, "transform_not_ok"};
+    if (res.transform.overlap < args.min_overlap) return {false, "low_overlap"};
+    if (static_cast<int>(res.transform.pairs.size()) < args.min_pairs) return {false, "few_pairs"};
+    if (std::abs(rel_t.z()) > args.max_rel_z) return {false, "bad_rel_z"};
+    if (std::abs(rel_roll) > args.max_rel_roll) return {false, "bad_roll"};
+    if (std::abs(rel_pitch) > args.max_rel_pitch) return {false, "bad_pitch"};
+    if (std::abs(rel_yaw) > args.max_rel_yaw) return {false, "bad_yaw"};
+    if (!std::isfinite(prior_err_xy) || prior_err_xy > args.prior_gate_xy_m) return {false, "bad_prior_xy"};
+    if (!std::isfinite(prior_err_yaw) || prior_err_yaw > args.prior_gate_yaw_rad) return {false, "bad_prior_yaw"};
+    return {true, "ok"};
+}
+
+std::vector<size_t> CandidateSlotsIntra(const treelocpp::Dataset& dataset,
+                                        size_t query_slot,
+                                        const treelocpp::Pose& prior,
+                                        const Args& args) {
+    std::vector<size_t> candidate_slots;
+    const auto& qf = dataset.frames[query_slot];
+    for (size_t i = 0; i < dataset.frames.size(); ++i) {
+        const auto& cf = dataset.frames[i];
+        if (args.exclude_self && cf.index == qf.index) continue;
+        if (PoseDistanceXYLocal(cf.pose, prior) <= args.search_radius_m) candidate_slots.push_back(i);
+    }
+    return candidate_slots;
+}
+
+std::vector<size_t> CandidateSlotsExternal(const treelocpp::Dataset& database,
+                                           const Args& args) {
+    std::vector<size_t> candidate_slots;
+    const double r2 = args.search_radius_m * args.search_radius_m;
+    for (size_t i = 0; i < database.frames.size(); ++i) {
+        const auto& p = database.frames[i].pose;
+        const double dx = p.x - args.prior_x;
+        const double dy = p.y - args.prior_y;
+        if (dx * dx + dy * dy <= r2) candidate_slots.push_back(i);
+    }
+    return candidate_slots;
+}
+
+void PrintHeader() {
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout
+        << "rank"
+        << " q_idx"
+        << " db_idx"
+        << " accepted"
+        << " reject_reason"
+        << " overlap"
+        << " matched_pairs"
+        << " retrieval_score"
+        << " hash_score"
+        << " prior_dist"
+        << " gt_dist"
+        << " rel_x"
+        << " rel_y"
+        << " rel_z"
+        << " rel_roll"
+        << " rel_pitch"
+        << " rel_yaw"
+        << " est_x"
+        << " est_y"
+        << " est_z"
+        << " est_yaw"
+        << " gt_x"
+        << " gt_y"
+        << " gt_z"
+        << " gt_yaw"
+        << " err_xy"
+        << " err_z"
+        << " err_yaw"
+        << " prior_err_xy"
+        << " prior_err_yaw"
+        << "\n";
 }
 
 }  // namespace
-}  // namespace treelocpp
 
 int main(int argc, char** argv) {
     try {
-        using namespace treelocpp;
         const Args args = ParseArgs(argc, argv);
+        const bool external_mode = !args.query_root.empty();
 
-        Config config;
+        treelocpp::Config config;
         std::string error;
-        if (!LoadConfig(args.config_path, config, &error)) {
-            throw std::runtime_error("failed to load config: " + error);
+        if (!treelocpp::LoadConfig(args.config_path, config, &error)) {
+            throw std::runtime_error(error);
         }
-        RefreshDerivedConfig(config);
+        treelocpp::RefreshDerivedConfig(config);
 
-        const std::filesystem::path database_root = args.database_root.empty()
-            ? config.dataset_root
-            : args.database_root;
+        treelocpp::Dataset query_dataset;
+        treelocpp::Dataset database_dataset;
+        size_t query_slot = 0;
+        std::vector<size_t> candidate_slots;
+        treelocpp::Pose prior_pose;
+        bool has_gt_pose = false;
 
-        Dataset query = LoadDataset(args.query_root, config, false);
-        Dataset database = LoadDataset(database_root, config, config.neighbor_past_only);
-        if (query.frames.empty()) throw std::runtime_error("query dataset has no usable frames");
-        if (database.frames.empty()) throw std::runtime_error("database dataset has no usable frames");
+        if (external_mode) {
+            std::cerr << "Loading query dataset: " << args.query_root << "\n";
+            query_dataset = treelocpp::LoadDataset(args.query_root, config, false);
+            std::cerr << "Loading database dataset: " << args.database_root << "\n";
+            database_dataset = treelocpp::LoadDataset(args.database_root, config, config.neighbor_past_only);
+            if (query_dataset.frames.empty()) throw std::runtime_error("query dataset has no usable frames");
+            if (database_dataset.frames.empty()) throw std::runtime_error("database dataset has no usable frames");
+            query_slot = 0;
+            prior_pose.x = args.prior_x;
+            prior_pose.y = args.prior_y;
+            prior_pose.z = 0.0;
+            const double half = 0.5 * args.prior_yaw;
+            prior_pose.qz = std::sin(half);
+            prior_pose.qw = std::cos(half);
+            candidate_slots = CandidateSlotsExternal(database_dataset, args);
+            std::cerr << "mode: external\n";
+            std::cerr << "query_root: " << args.query_root << "\n";
+            std::cerr << "database_root: " << args.database_root << "\n";
+        } else {
+            config.mode = "intra";
+            std::cerr << "Loading dataset: " << config.dataset_root << "\n";
+            query_dataset = treelocpp::LoadDataset(config.dataset_root, config, config.neighbor_past_only);
+            database_dataset = query_dataset;
+            query_slot = SlotOf(query_dataset, args.query_idx, "query");
+            const size_t prior_slot = SlotOf(query_dataset, args.prior_idx, "prior");
+            prior_pose = query_dataset.frames[prior_slot].pose;
+            candidate_slots = CandidateSlotsIntra(database_dataset, query_slot, prior_pose, args);
+            has_gt_pose = true;
+            std::cerr << "mode: intra\n";
+            std::cerr << "query_idx: " << args.query_idx << "\n";
+            std::cerr << "prior_idx: " << args.prior_idx << "\n";
+        }
 
-        const size_t query_slot = 0;
-        const FrameData& qf = query.frames[query_slot];
-        const std::vector<size_t> candidates = PriorCandidates(database, args);
-        if (candidates.empty()) throw std::runtime_error("no database candidates inside search radius");
+        if (candidate_slots.empty()) throw std::runtime_error("no candidate anchors within search radius");
 
-        std::vector<CandidateResult> results = RankCandidates(query, database, query_slot, candidates, config);
-        std::sort(results.begin(), results.end(), [](const CandidateResult& a, const CandidateResult& b) {
-            if (a.transform.ok != b.transform.ok) return a.transform.ok > b.transform.ok;
-            if (std::abs(a.transform.overlap - b.transform.overlap) > 1e-12) return a.transform.overlap > b.transform.overlap;
-            return a.retrieval_score > b.retrieval_score;
-        });
+        const auto& qf = query_dataset.frames[query_slot];
+        std::cerr << "search_radius_m: " << args.search_radius_m << "\n";
+        std::cerr << "candidate_count: " << candidate_slots.size() << "\n";
 
-        std::cout << std::fixed << std::setprecision(6);
-        std::cout << "query_root=" << args.query_root
-                  << " database_root=" << database_root
-                  << " query_frames=" << query.frames.size()
-                  << " database_frames=" << database.frames.size()
-                  << " candidate_count=" << candidates.size() << "\n";
-        std::cout << "rank q_idx db_idx accepted reject_reason overlap matched_pairs retrieval_score hash_score "
-                  << "rel_x rel_y rel_z rel_roll rel_pitch rel_yaw "
-                  << "est_x est_y est_z est_yaw prior_err_xy prior_err_yaw\n";
+        auto results = treelocpp::RankCandidates(
+            query_dataset,
+            database_dataset,
+            query_slot,
+            candidate_slots,
+            config
+        );
 
-        const int n = std::min(args.top_k, static_cast<int>(results.size()));
-        for (int i = 0; i < n; ++i) {
-            const CandidateResult& r = results[i];
-            auto it = database.frame_to_slot.find(r.candidate_index);
-            if (it == database.frame_to_slot.end()) continue;
-            const FrameData& cf = database.frames[it->second];
+        std::sort(
+            results.begin(),
+            results.end(),
+            [](const treelocpp::CandidateResult& a, const treelocpp::CandidateResult& b) {
+                if (a.transform.ok != b.transform.ok) return a.transform.ok > b.transform.ok;
+                if (a.transform.overlap != b.transform.overlap) return a.transform.overlap > b.transform.overlap;
+                return a.retrieval_score > b.retrieval_score;
+            }
+        );
 
-            Eigen::Matrix4d T_qc = Eigen::Matrix4d::Identity();
-            if (r.transform.ok) T_qc = PredictedRelativeTransform(qf, cf, r);
+        PrintHeader();
+
+        const int n = std::min<int>(args.top_k, static_cast<int>(results.size()));
+        for (int r = 0; r < n; ++r) {
+            const auto& res = results[r];
+            const size_t cand_slot = SlotOf(database_dataset, res.candidate_index, "candidate");
+            const auto& cf = database_dataset.frames[cand_slot];
+
+            const double prior_dist = PoseDistanceXYLocal(cf.pose, prior_pose);
+            const double gt_dist = has_gt_pose ? PoseDistanceXYLocal(cf.pose, qf.pose) : std::numeric_limits<double>::quiet_NaN();
+
             double rel_roll = 0.0;
             double rel_pitch = 0.0;
             double rel_yaw = 0.0;
-            EulerZYX(T_qc.block<3, 3>(0, 0), rel_roll, rel_pitch, rel_yaw);
-            const Eigen::Vector3d rel_t = T_qc.block<3, 1>(0, 3);
+            Eigen::Vector3d rel_t = Eigen::Vector3d::Zero();
 
-            const Eigen::Matrix4d T_mc = PoseToTransform(cf.pose);
-            const Eigen::Matrix4d T_mq = r.transform.ok ? T_mc * T_qc.inverse() : Eigen::Matrix4d::Identity();
-            double est_roll = 0.0;
-            double est_pitch = 0.0;
-            double est_yaw = 0.0;
-            EulerZYX(T_mq.block<3, 3>(0, 0), est_roll, est_pitch, est_yaw);
-            const Eigen::Vector3d est_t = T_mq.block<3, 1>(0, 3);
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            double est_x = nan;
+            double est_y = nan;
+            double est_z = nan;
+            double est_yaw = nan;
+            double gt_x = has_gt_pose ? qf.pose.x : nan;
+            double gt_y = has_gt_pose ? qf.pose.y : nan;
+            double gt_z = has_gt_pose ? qf.pose.z : nan;
+            double gt_yaw = has_gt_pose ? treelocpp::YawFromPose(qf.pose) : nan;
+            double err_xy = nan;
+            double err_z = nan;
+            double err_yaw = nan;
+            double prior_err_xy = nan;
+            double prior_err_yaw = nan;
 
-            const double dx = est_t.x() - args.prior_x;
-            const double dy = est_t.y() - args.prior_y;
-            const double prior_err_xy = std::hypot(dx, dy);
-            const double prior_err_yaw = std::abs(WrapAngle(est_yaw - args.prior_yaw));
-            const std::string reason = RejectReason(
-                r, rel_t.z(), rel_roll, rel_pitch, rel_yaw, prior_err_xy, prior_err_yaw, args);
-            const int accepted = reason == "ok" ? 1 : 0;
+            if (res.transform.ok) {
+                const Eigen::Matrix4d T_query_candidate = PredictedRelativeTransform(qf, cf, res);
+                rel_t = T_query_candidate.block<3, 1>(0, 3);
+                treelocpp::EulerZYX(T_query_candidate.block<3, 3>(0, 0), rel_roll, rel_pitch, rel_yaw);
 
-            std::cout << i << ' ' << r.query_index << ' ' << r.candidate_index << ' '
-                      << "accepted=" << accepted << ' '
-                      << reason << ' '
-                      << r.transform.overlap << ' '
-                      << r.transform.pairs.size() << ' '
-                      << r.retrieval_score << ' '
-                      << r.hash_score << ' '
-                      << rel_t.x() << ' ' << rel_t.y() << ' ' << rel_t.z() << ' '
-                      << rel_roll << ' ' << rel_pitch << ' ' << rel_yaw << ' '
-                      << est_t.x() << ' ' << est_t.y() << ' ' << est_t.z() << ' ' << est_yaw << ' '
-                      << prior_err_xy << ' ' << prior_err_yaw << "\n";
+                const Eigen::Matrix4d T_map_candidate = treelocpp::PoseToTransform(cf.pose);
+                const Eigen::Matrix4d T_map_query_est = T_map_candidate * T_query_candidate.inverse();
+                const Eigen::Vector3d est_p = T_map_query_est.block<3, 1>(0, 3);
+                est_x = est_p.x();
+                est_y = est_p.y();
+                est_z = est_p.z();
+                est_yaw = YawFromTransform(T_map_query_est);
+
+                if (has_gt_pose) {
+                    const double dx = est_x - gt_x;
+                    const double dy = est_y - gt_y;
+                    err_xy = std::sqrt(dx * dx + dy * dy);
+                    err_z = std::abs(est_z - gt_z);
+                    err_yaw = std::abs(treelocpp::WrapAngle(est_yaw - gt_yaw));
+                }
+                const double pdx = est_x - prior_pose.x;
+                const double pdy = est_y - prior_pose.y;
+                prior_err_xy = std::sqrt(pdx * pdx + pdy * pdy);
+                prior_err_yaw = std::abs(treelocpp::WrapAngle(est_yaw - treelocpp::YawFromPose(prior_pose)));
+            }
+
+            const GateResult gate = CheckGate(
+                res,
+                rel_t,
+                rel_roll,
+                rel_pitch,
+                rel_yaw,
+                prior_err_xy,
+                prior_err_yaw,
+                args
+            );
+
+            std::cout
+                << r
+                << " " << res.query_index
+                << " " << res.candidate_index
+                << " " << (gate.accepted ? 1 : 0)
+                << " " << gate.reason
+                << " " << res.transform.overlap
+                << " " << res.transform.pairs.size()
+                << " " << res.retrieval_score
+                << " " << res.hash_score
+                << " " << prior_dist
+                << " " << gt_dist
+                << " " << rel_t.x()
+                << " " << rel_t.y()
+                << " " << rel_t.z()
+                << " " << rel_roll
+                << " " << rel_pitch
+                << " " << rel_yaw
+                << " " << est_x
+                << " " << est_y
+                << " " << est_z
+                << " " << est_yaw
+                << " " << gt_x
+                << " " << gt_y
+                << " " << gt_z
+                << " " << gt_yaw
+                << " " << err_xy
+                << " " << err_z
+                << " " << err_yaw
+                << " " << prior_err_xy
+                << " " << prior_err_yaw
+                << "\n";
         }
+
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "treelocpp_localize error: " << e.what() << "\n";
+        PrintUsage(argv[0]);
         return 1;
     }
 }
