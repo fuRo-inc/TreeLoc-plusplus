@@ -8,3 +8,6 @@ __pycache__/
 results/
 tmp/
 local_tools/
+payload*
+data/
+query
