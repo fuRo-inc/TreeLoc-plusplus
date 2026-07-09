@@ -46,7 +46,7 @@ struct Args {
         << "  --prior_z Z          default 0\n"
         << "  --search_radius M   default 30\n"
         << "  --top_k N           default 20\n"
-        << "  --match_distance M  prior-fallback NN distance. default 2.0\n"
+        << "  --match_distance M  prior-assisted NN distance. default 2.0\n"
         << "  --min_pairs N       default 2\n"
         << "  --min_overlap V     default 0.10\n"
         << "  --prior_gate_xy M   default 10\n"
@@ -118,49 +118,126 @@ double YawFromMatrix(const Eigen::Matrix3d& R) {
     return yaw;
 }
 
+struct MatchPair {
+    Eigen::Vector2d q;
+    Eigen::Vector2d c;
+    double dist = 0.0;
+};
+
+Eigen::Matrix3d EstimateRigid2D(const std::vector<MatchPair>& pairs) {
+    Eigen::Matrix3d T = Eigen::Matrix3d::Identity();
+    if (pairs.empty()) return T;
+    Eigen::Vector2d q_mean = Eigen::Vector2d::Zero();
+    Eigen::Vector2d c_mean = Eigen::Vector2d::Zero();
+    for (const auto& p : pairs) {
+        q_mean += p.q;
+        c_mean += p.c;
+    }
+    q_mean /= static_cast<double>(pairs.size());
+    c_mean /= static_cast<double>(pairs.size());
+
+    if (pairs.size() == 1) {
+        T.block<2, 1>(0, 2) = c_mean - q_mean;
+        return T;
+    }
+
+    Eigen::Matrix2d H = Eigen::Matrix2d::Zero();
+    for (const auto& p : pairs) {
+        H += (p.q - q_mean) * (p.c - c_mean).transpose();
+    }
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix2d R = svd.matrixV() * svd.matrixU().transpose();
+    if (R.determinant() < 0.0) {
+        Eigen::Matrix2d V = svd.matrixV();
+        V.col(1) *= -1.0;
+        R = V * svd.matrixU().transpose();
+    }
+    const Eigen::Vector2d t = c_mean - R * q_mean;
+    T.block<2, 2>(0, 0) = R;
+    T.block<2, 1>(0, 2) = t;
+    return T;
+}
+
 struct FallbackResult {
     int pairs = 0;
     double overlap = 0.0;
     Eigen::Matrix4d T_map_query = Eigen::Matrix4d::Identity();
+    double mean_residual = std::numeric_limits<double>::quiet_NaN();
+    double max_residual = std::numeric_limits<double>::quiet_NaN();
     double prior_err_xy = std::numeric_limits<double>::quiet_NaN();
     double prior_err_yaw = std::numeric_limits<double>::quiet_NaN();
 };
 
-FallbackResult PriorFallback(const treelocpp::FrameData& qf,
-                             const treelocpp::FrameData& cf,
-                             const Eigen::Matrix4d& T_map_prior,
-                             double prior_yaw,
-                             double match_distance) {
+FallbackResult PriorAssistedNN(const treelocpp::FrameData& qf,
+                               const treelocpp::FrameData& cf,
+                               const Eigen::Matrix4d& T_map_prior,
+                               double prior_yaw,
+                               double match_distance) {
     FallbackResult out;
     const Eigen::Matrix4d T_map_candidate = treelocpp::PoseToTransform(cf.pose);
-    const Eigen::Matrix4d T_candidate_query = T_map_candidate.inverse() * T_map_prior;
-    const Eigen::Matrix2d R = T_candidate_query.block<2, 2>(0, 0);
-    const Eigen::Vector2d t = T_candidate_query.block<2, 1>(0, 3);
+    const Eigen::Matrix4d T_candidate_query_seed = T_map_candidate.inverse() * T_map_prior;
+    const Eigen::Matrix2d R_seed = T_candidate_query_seed.block<2, 2>(0, 0);
+    const Eigen::Vector2d t_seed = T_candidate_query_seed.block<2, 1>(0, 3);
 
     std::vector<char> q_used(qf.trees.size(), 0);
+    std::vector<MatchPair> pairs;
+    pairs.reserve(std::min(qf.trees.size(), cf.trees.size()));
+
     for (const auto& ct : cf.trees) {
         const Eigen::Vector2d cp(ct.x, ct.y);
         int best = -1;
         double best_d2 = match_distance * match_distance;
+        Eigen::Vector2d best_seed_q = Eigen::Vector2d::Zero();
         for (int qi = 0; qi < static_cast<int>(qf.trees.size()); ++qi) {
             if (q_used[qi]) continue;
             const auto& qt = qf.trees[qi];
-            const Eigen::Vector2d qp = R * Eigen::Vector2d(qt.x, qt.y) + t;
-            const double d2 = (qp - cp).squaredNorm();
+            const Eigen::Vector2d qp_seed = R_seed * Eigen::Vector2d(qt.x, qt.y) + t_seed;
+            const double d2 = (qp_seed - cp).squaredNorm();
             if (d2 <= best_d2) {
                 best_d2 = d2;
                 best = qi;
+                best_seed_q = qp_seed;
             }
         }
         if (best >= 0) {
             q_used[best] = 1;
-            ++out.pairs;
+            const auto& qt = qf.trees[best];
+            pairs.push_back({Eigen::Vector2d(qt.x, qt.y), cp, std::sqrt(best_d2)});
         }
     }
 
+    out.pairs = static_cast<int>(pairs.size());
     const int uni = static_cast<int>(qf.trees.size() + cf.trees.size() - out.pairs);
     out.overlap = uni > 0 ? static_cast<double>(out.pairs) / static_cast<double>(uni) : 0.0;
+
+    Eigen::Matrix3d T_candidate_query_2d = Eigen::Matrix3d::Identity();
+    if (pairs.size() >= 2) {
+        T_candidate_query_2d = EstimateRigid2D(pairs);
+    } else {
+        T_candidate_query_2d.block<2, 2>(0, 0) = R_seed;
+        T_candidate_query_2d.block<2, 1>(0, 2) = t_seed;
+    }
+
+    Eigen::Matrix4d T_candidate_query = Eigen::Matrix4d::Identity();
+    T_candidate_query.block<2, 2>(0, 0) = T_candidate_query_2d.block<2, 2>(0, 0);
+    T_candidate_query.block<2, 1>(0, 3) = T_candidate_query_2d.block<2, 1>(0, 2);
+    T_candidate_query(2, 3) = T_candidate_query_seed(2, 3);
     out.T_map_query = T_map_candidate * T_candidate_query;
+
+    if (!pairs.empty()) {
+        double sum = 0.0;
+        double mx = 0.0;
+        const Eigen::Matrix2d R = T_candidate_query.block<2, 2>(0, 0);
+        const Eigen::Vector2d t = T_candidate_query.block<2, 1>(0, 3);
+        for (const auto& p : pairs) {
+            const double e = (R * p.q + t - p.c).norm();
+            sum += e;
+            mx = std::max(mx, e);
+        }
+        out.mean_residual = sum / static_cast<double>(pairs.size());
+        out.max_residual = mx;
+    }
+
     const Eigen::Vector3d est = out.T_map_query.block<3, 1>(0, 3);
     out.prior_err_xy = std::hypot(est.x() - T_map_prior(0, 3), est.y() - T_map_prior(1, 3));
     out.prior_err_yaw = std::abs(treelocpp::WrapAngle(YawFromMatrix(out.T_map_query.block<3, 3>(0, 0)) - prior_yaw));
@@ -175,6 +252,8 @@ struct Row {
     bool rank_transform_ok = false;
     int fallback_pairs = 0;
     double fallback_overlap = 0.0;
+    double nn_mean_residual = std::numeric_limits<double>::quiet_NaN();
+    double nn_max_residual = std::numeric_limits<double>::quiet_NaN();
     int accepted = 0;
     double est_x = std::numeric_limits<double>::quiet_NaN();
     double est_y = std::numeric_limits<double>::quiet_NaN();
@@ -223,9 +302,11 @@ int main(int argc, char** argv) {
                 row.hash_score = it->second.hash_score;
                 row.rank_transform_ok = it->second.transform.ok;
             }
-            const FallbackResult fb = PriorFallback(qf, cf, T_map_prior, args.prior_yaw, args.match_distance);
+            const FallbackResult fb = PriorAssistedNN(qf, cf, T_map_prior, args.prior_yaw, args.match_distance);
             row.fallback_pairs = fb.pairs;
             row.fallback_overlap = fb.overlap;
+            row.nn_mean_residual = fb.mean_residual;
+            row.nn_max_residual = fb.max_residual;
             row.est_x = fb.T_map_query(0, 3);
             row.est_y = fb.T_map_query(1, 3);
             row.est_z = fb.T_map_query(2, 3);
@@ -254,7 +335,8 @@ int main(int argc, char** argv) {
                   << " candidate_count=" << candidates.size()
                   << " match_distance=" << args.match_distance << "\n";
         std::cout << "rank db_idx accepted prior_dist retrieval_score hash_score rank_transform_ok "
-                  << "fallback_pairs fallback_overlap est_x est_y est_z est_yaw prior_err_xy prior_err_yaw\n";
+                  << "nn_pairs nn_overlap nn_mean_residual nn_max_residual "
+                  << "est_x est_y est_z est_yaw prior_err_xy prior_err_yaw\n";
         const int n = std::min(args.top_k, static_cast<int>(rows.size()));
         for (int i = 0; i < n; ++i) {
             const Row& r = rows[i];
@@ -267,6 +349,8 @@ int main(int argc, char** argv) {
                       << (r.rank_transform_ok ? 1 : 0) << ' '
                       << r.fallback_pairs << ' '
                       << r.fallback_overlap << ' '
+                      << r.nn_mean_residual << ' '
+                      << r.nn_max_residual << ' '
                       << r.est_x << ' '
                       << r.est_y << ' '
                       << r.est_z << ' '
