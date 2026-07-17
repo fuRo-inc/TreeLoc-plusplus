@@ -63,6 +63,21 @@ if(BUILD_TESTING)
         NAME treelocpp_frame_data_api_smoke
         COMMAND treelocpp_frame_data_api_smoke
     )
+
+    add_executable(
+        treelocpp_hypothesis_localization_api_smoke
+        tests/hypothesis_localization_api_smoke.cpp
+    )
+    target_link_libraries(
+        treelocpp_hypothesis_localization_api_smoke
+        PRIVATE treelocpp
+    )
+    add_test(
+        NAME treelocpp_hypothesis_localization_api_smoke
+        COMMAND
+            treelocpp_hypothesis_localization_api_smoke
+            ${CMAKE_CURRENT_SOURCE_DIR}/config/furo_cpp_relaxed_intra.yaml
+    )
 endif()
 
 find_package(GTSAM QUIET)

@@ -26,42 +26,18 @@ constexpr std::array<std::array<int, 3>, 6> kTrianglePermutations{{
     {{1, 2, 0}}, {{2, 0, 1}}, {{2, 1, 0}}
 }};
 
-struct Args {
+struct Args : treelocpp::HypothesisLocalizationOptions {
     std::filesystem::path config_path;
     std::filesystem::path query_root;
     std::filesystem::path database_root;
+
     double prior_x = 0.0;
     double prior_y = 0.0;
     double prior_z = 0.0;
     double prior_yaw = 0.0;
-    double search_radius = 30.0;
+
+    // This only limits CLI diagnostic rows. It is not a localization gate.
     int top_k = 20;
-    double match_distance = 1.5;
-    int refine_iterations = 5;
-    // Partial-tree candidates commonly have only an unstable axis diameter.
-    // Keep DBH out of the SE(2) hypothesis score unless explicitly requested.
-    double dbh_soft_weight = 0.0;
-    double triangle_edge_tolerance = 0.5;
-    int triangle_max_hypotheses = 500;
-    double consensus_xy = 2.0;
-    double consensus_yaw = 0.15;
-    int min_consensus_support = 3;
-    int min_consensus_margin = 1;
-    int min_pairs = 6;
-
-    // Query-to-map localization is asymmetric: the database inventory
-    // normally contains more trees than a single query observation.
-    // Therefore query coverage is the primary completeness gate.
-    double min_query_coverage = 0.40;
-
-    // Symmetric IoU is retained as an optional diagnostic/safety gate,
-    // but disabled by default because it penalizes a complete map against
-    // a partial query.
-    double min_overlap = 0.0;
-    double max_mean_residual = 0.35;
-    double max_max_residual = 0.85;
-    double prior_gate_xy = 10.0;
-    double prior_gate_yaw = 0.7;
 };
 
 [[noreturn]] void Usage(const char* argv0) {
@@ -678,6 +654,305 @@ ConsensusResult BuildTriangleConsensus(std::vector<Row>& rows, const Args& args)
 }
 
 }  // namespace
+
+treelocpp::HypothesisLocalizationResult treelocpp::LocalizeHypotheses(
+    const FrameData& query,
+    const Dataset& database,
+    const Pose& map_query_prior,
+    const Config& config,
+    const HypothesisLocalizationOptions& options) {
+    if (query.trees.size() < 3 || query.hashes.empty()) {
+        throw std::invalid_argument("query frame is not usable");
+    }
+    if (database.frames.empty()) {
+        throw std::invalid_argument("database dataset has no usable frames");
+    }
+    if (options.search_radius <= 0.0) {
+        throw std::invalid_argument("search_radius must be positive");
+    }
+    if (options.match_distance <= 0.0) {
+        throw std::invalid_argument("match_distance must be positive");
+    }
+    if (options.refine_iterations < 0) {
+        throw std::invalid_argument("refine_iterations must be non-negative");
+    }
+    if (options.triangle_edge_tolerance <= 0.0) {
+        throw std::invalid_argument(
+            "triangle_edge_tolerance must be positive");
+    }
+    if (options.triangle_max_hypotheses <= 0) {
+        throw std::invalid_argument(
+            "triangle_max_hypotheses must be positive");
+    }
+    if (options.consensus_xy <= 0.0 ||
+        options.consensus_yaw <= 0.0) {
+        throw std::invalid_argument(
+            "consensus thresholds must be positive");
+    }
+    if (options.min_consensus_support <= 0) {
+        throw std::invalid_argument(
+            "min_consensus_support must be positive");
+    }
+    if (options.min_consensus_margin < 0) {
+        throw std::invalid_argument(
+            "min_consensus_margin must be non-negative");
+    }
+
+    Args args;
+    static_cast<HypothesisLocalizationOptions&>(args) = options;
+    args.prior_x = map_query_prior.x;
+    args.prior_y = map_query_prior.y;
+    args.prior_z = map_query_prior.z;
+
+    const Eigen::Matrix4d prior_pose =
+        treelocpp::PoseToTransform(map_query_prior);
+    args.prior_yaw = YawFromMatrix(
+        prior_pose.block<3, 3>(0, 0));
+
+    Dataset query_set;
+    query_set.trajectory.push_back(query.pose);
+    query_set.frame_to_slot[query.index] = 0;
+    query_set.frames.push_back(query);
+
+    const Dataset& database_set = database;
+
+    const auto candidate_slots = CandidateSlots(database_set, args);
+    if (candidate_slots.empty()) throw std::runtime_error("no candidate anchors inside search radius");
+    const auto ranked = treelocpp::RankCandidates(
+        query_set, database_set, 0, candidate_slots, config
+    );
+    std::unordered_map<int, treelocpp::CandidateResult> rank_by_index;
+    for (const auto& result : ranked) rank_by_index[result.candidate_index] = result;
+    const Eigen::Matrix4d T_map_prior = PoseFromXYYaw(
+        args.prior_x, args.prior_y, args.prior_z, args.prior_yaw
+    );
+    std::vector<Row> rows;
+    for (size_t slot : candidate_slots) {
+        const auto& candidate = database_set.frames[slot];
+        Row row;
+        row.db_idx = candidate.index;
+        row.prior_dist = std::hypot(
+            candidate.pose.x - args.prior_x,
+            candidate.pose.y - args.prior_y
+        );
+        const Eigen::Matrix4d T_map_candidate = treelocpp::PoseToTransform(candidate.pose);
+        const Eigen::Matrix4d T_candidate_query_prior =
+            T_map_candidate.inverse() * T_map_prior;
+        row.prior = RefineHypothesis(
+            query, candidate, T_candidate_query_prior, T_map_prior,
+            args.prior_yaw, "prior", args
+        );
+        row.selected = row.prior;
+        auto rank_it = rank_by_index.find(candidate.index);
+        if (rank_it != rank_by_index.end()) {
+            const auto& rank = rank_it->second;
+            row.retrieval_score = rank.retrieval_score;
+            row.hash_score = rank.hash_score;
+            row.rank_transform_ok = rank.transform.ok;
+            if (rank.transform.ok) {
+                Eigen::Matrix4d T_candidate_query_treeloc = T_candidate_query_prior;
+                T_candidate_query_treeloc.block<2, 2>(0, 0) = rank.transform.R;
+                T_candidate_query_treeloc.block<2, 1>(0, 3) = rank.transform.t;
+                row.treeloc = RefineHypothesis(
+                    query, candidate, T_candidate_query_treeloc, T_map_prior,
+                    args.prior_yaw, "treeloc", args
+                );
+                if (Better(row.treeloc, row.selected)) row.selected = row.treeloc;
+            }
+        }
+        auto triangle_seeds = BuildTolerantTriangleSeeds(query, candidate, args);
+        row.triangle_hypothesis_count = static_cast<int>(triangle_seeds.size());
+        for (auto& seed : triangle_seeds) {
+            seed.T_candidate_query(2, 3) = T_candidate_query_prior(2, 3);
+            const auto hypothesis = RefineHypothesis(
+                query, candidate, seed.T_candidate_query, T_map_prior,
+                args.prior_yaw, "triangle", args
+            );
+            if (Better(hypothesis, row.triangle)) row.triangle = hypothesis;
+        }
+        if (Better(row.triangle, row.selected)) row.selected = row.triangle;
+        ApplyGate(row, args);
+        rows.push_back(std::move(row));
+    }
+    ConsensusResult consensus = BuildTriangleConsensus(rows, args);
+    if (consensus.support > 0) {
+        // TreeLoc++ supplies only x/y/yaw. Height remains the external
+        // prior (normally LIO/IMU), and roll/pitch are never estimated.
+        consensus.T_map_query(2, 3) = args.prior_z;
+    }
+    const auto is_consensus_member = [&](const Row& row) {
+        return std::find(
+            consensus.member_db_indices.begin(),
+            consensus.member_db_indices.end(),
+            row.db_idx
+        ) != consensus.member_db_indices.end();
+    };
+    const auto is_final_selected = [&](const Row& row) {
+        return consensus.ok && row.db_idx == consensus.representative_db_idx;
+    };
+    std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+        if (is_final_selected(a) != is_final_selected(b)) {
+            return is_final_selected(a);
+        }
+        if (is_consensus_member(a) != is_consensus_member(b)) {
+            return is_consensus_member(a);
+        }
+        if (a.triangle_consensus_support != b.triangle_consensus_support) {
+            return a.triangle_consensus_support > b.triangle_consensus_support;
+        }
+        if (a.accepted != b.accepted) return a.accepted > b.accepted;
+        if (Better(a.selected, b.selected)) return true;
+        if (Better(b.selected, a.selected)) return false;
+        return a.prior_dist < b.prior_dist;
+    });
+    const auto representative = std::find_if(
+        rows.begin(), rows.end(), [&](const Row& row) {
+            return row.db_idx == consensus.representative_db_idx;
+        }
+    );
+    const Eigen::Matrix4d T_odom_query = treelocpp::PoseToTransform(query.pose);
+    const double odom_query_yaw = YawFromMatrix(
+        T_odom_query.block<3, 3>(0, 0)
+    );
+    const Eigen::Matrix4d T_odom_query_planar = PoseFromXYYaw(
+        query.pose.x, query.pose.y, 0.0, odom_query_yaw
+    );
+    const Eigen::Matrix4d T_map_prior_planar = PoseFromXYYaw(
+        args.prior_x, args.prior_y, 0.0, args.prior_yaw
+    );
+    const Eigen::Matrix4d T_map_query_planar = PoseFromXYYaw(
+        consensus.T_map_query(0, 3),
+        consensus.T_map_query(1, 3),
+        0.0,
+        YawFromMatrix(consensus.T_map_query.block<3, 3>(0, 0))
+    );
+    const Eigen::Matrix4d T_map_odom_prior =
+        T_map_prior_planar * T_odom_query_planar.inverse();
+    const Eigen::Matrix4d T_map_odom_candidate =
+        T_map_query_planar * T_odom_query_planar.inverse();
+    const Eigen::Matrix4d T_difference =
+        T_map_odom_candidate * T_map_odom_prior.inverse();
+    const PoseSummary map_query_summary = SummarizePose(consensus.T_map_query);
+    const PoseSummary odom_query_summary = SummarizePose(T_odom_query);
+    const PoseSummary map_odom_summary = SummarizePose(T_map_odom_candidate);
+    const PoseSummary map_odom_prior_summary = SummarizePose(T_map_odom_prior);
+    const PoseSummary difference_summary = SummarizePose(T_difference);
+    const Eigen::Vector3d parameter_translation_difference =
+        map_odom_summary.translation - map_odom_prior_summary.translation;
+    const double parameter_yaw_difference = treelocpp::WrapAngle(
+        map_odom_summary.yaw - map_odom_prior_summary.yaw
+    );
+
+    HypothesisLocalizationResult result;
+    result.query_index = query.index;
+    result.candidate_count = static_cast<int>(candidate_slots.size());
+    result.ok = consensus.ok;
+    result.ambiguous = consensus.ambiguous;
+    result.map_index =
+        consensus.ok ? consensus.representative_db_idx : -1;
+    result.support = consensus.support;
+    result.runner_up_support = consensus.runner_up_support;
+    result.consensus_database_indices =
+        consensus.member_db_indices;
+
+    if (result.ok) {
+        result.status = "ok";
+    } else if (result.ambiguous) {
+        result.status = "ambiguous";
+    } else if (result.support == 0) {
+        result.status = "no_consensus";
+    } else {
+        result.status = "insufficient_consensus";
+    }
+
+    const HypothesisResult* representative_hypothesis =
+        result.ok && representative != rows.end()
+        ? &representative->triangle
+        : nullptr;
+
+    if (representative_hypothesis != nullptr) {
+        result.pairs = representative_hypothesis->pairs;
+        result.overlap = representative_hypothesis->overlap;
+        result.query_coverage =
+            representative_hypothesis->query_coverage;
+        result.candidate_coverage =
+            representative_hypothesis->candidate_coverage;
+        result.mean_residual =
+            representative_hypothesis->mean_residual;
+        result.max_residual =
+            representative_hypothesis->max_residual;
+    }
+
+    if (result.ok) {
+        result.T_map_query = consensus.T_map_query;
+        result.T_map_odom = T_map_odom_candidate;
+        result.T_map_odom_prior = T_map_odom_prior;
+        result.lidar_update_planar =
+            difference_summary.translation.head<2>().norm();
+        result.lidar_update_yaw = difference_summary.yaw;
+        result.parameter_planar =
+            parameter_translation_difference.head<2>().norm();
+        result.parameter_yaw = parameter_yaw_difference;
+    }
+
+    result.candidates.reserve(rows.size());
+    for (const auto& row : rows) {
+        const auto& selected = row.selected;
+
+        HypothesisCandidateDiagnostic diagnostic;
+        diagnostic.database_index = row.db_idx;
+        diagnostic.prior_distance = row.prior_dist;
+        diagnostic.retrieval_score = row.retrieval_score;
+        diagnostic.hash_score = row.hash_score;
+        diagnostic.rank_transform_ok = row.rank_transform_ok;
+        diagnostic.triangle_hypothesis_count =
+            row.triangle_hypothesis_count;
+        diagnostic.triangle_consensus_support =
+            row.triangle_consensus_support;
+        diagnostic.intrinsic_ok =
+            PassesIntrinsicQuality(row.triangle, args);
+        diagnostic.consensus_member =
+            is_consensus_member(row);
+        diagnostic.final_selected =
+            is_final_selected(row);
+        diagnostic.accepted = row.accepted != 0;
+        diagnostic.reject_reason = row.reject_reason;
+        diagnostic.selected_source = selected.source;
+
+        diagnostic.prior_pairs = row.prior.pairs;
+        diagnostic.prior_mean_residual =
+            row.prior.mean_residual;
+        diagnostic.treeloc_pairs = row.treeloc.pairs;
+        diagnostic.treeloc_mean_residual =
+            row.treeloc.mean_residual;
+        diagnostic.triangle_pairs = row.triangle.pairs;
+        diagnostic.triangle_mean_residual =
+            row.triangle.mean_residual;
+
+        diagnostic.pairs = selected.pairs;
+        diagnostic.overlap = selected.overlap;
+        diagnostic.query_coverage =
+            selected.query_coverage;
+        diagnostic.candidate_coverage =
+            selected.candidate_coverage;
+        diagnostic.mean_residual =
+            selected.mean_residual;
+        diagnostic.max_residual =
+            selected.max_residual;
+        diagnostic.mean_dbh_difference =
+            selected.mean_dbh_difference;
+        diagnostic.prior_error_xy =
+            selected.prior_err_xy;
+        diagnostic.prior_error_yaw =
+            selected.prior_err_yaw;
+        diagnostic.T_map_query =
+            selected.T_map_query;
+
+        result.candidates.push_back(std::move(diagnostic));
+    }
+
+    return result;
+}
 
 int treelocpp::RunLocalizeHypothesesCli(int argc, char** argv) {
     try {
