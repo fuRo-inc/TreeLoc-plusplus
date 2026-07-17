@@ -18,6 +18,7 @@ add_library(treelocpp
     src/geometry.cpp
     src/io.cpp
     src/matching.cpp
+    src/localize_hypotheses.cpp
 )
 
 target_include_directories(treelocpp PUBLIC include)
