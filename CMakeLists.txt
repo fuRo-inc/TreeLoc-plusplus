@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TreeLocPP LANGUAGES CXX)
+project(TreeLocPP VERSION 0.1.0 LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -8,6 +8,9 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 find_package(Eigen3 REQUIRED)
 
@@ -21,7 +24,13 @@ add_library(treelocpp
     src/localize_hypotheses.cpp
 )
 
-target_include_directories(treelocpp PUBLIC include)
+target_include_directories(
+    treelocpp
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+add_library(TreeLocPP::treelocpp ALIAS treelocpp)
 target_link_libraries(treelocpp PUBLIC Eigen3::Eigen)
 
 add_executable(treelocpp_intra apps/intra.cpp)
@@ -95,3 +104,43 @@ elseif(GTSAM_FOUND)
 else()
     message(STATUS "GTSAM not found; treelocpp_graph_opt will not be built")
 endif()
+
+install(
+    TARGETS treelocpp
+    EXPORT TreeLocPPTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(
+    DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(
+    EXPORT TreeLocPPTargets
+    FILE TreeLocPPTargets.cmake
+    NAMESPACE TreeLocPP::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TreeLocPP
+)
+
+configure_package_config_file(
+    cmake/TreeLocPPConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/TreeLocPPConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TreeLocPP
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/TreeLocPPConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/TreeLocPPConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/TreeLocPPConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TreeLocPP
+)
