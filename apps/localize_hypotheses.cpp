@@ -37,16 +37,28 @@ struct Args {
     int top_k = 20;
     double match_distance = 1.5;
     int refine_iterations = 5;
-    double dbh_soft_weight = 0.25;
+    // Partial-tree candidates commonly have only an unstable axis diameter.
+    // Keep DBH out of the SE(2) hypothesis score unless explicitly requested.
+    double dbh_soft_weight = 0.0;
     double triangle_edge_tolerance = 0.5;
     int triangle_max_hypotheses = 500;
     double consensus_xy = 2.0;
     double consensus_yaw = 0.15;
     int min_consensus_support = 3;
+    int min_consensus_margin = 1;
     int min_pairs = 6;
-    double min_overlap = 0.30;
+
+    // Query-to-map localization is asymmetric: the database inventory
+    // normally contains more trees than a single query observation.
+    // Therefore query coverage is the primary completeness gate.
+    double min_query_coverage = 0.40;
+
+    // Symmetric IoU is retained as an optional diagnostic/safety gate,
+    // but disabled by default because it penalizes a complete map against
+    // a partial query.
+    double min_overlap = 0.0;
     double max_mean_residual = 0.35;
-    double max_max_residual = 0.80;
+    double max_max_residual = 0.85;
     double prior_gate_xy = 10.0;
     double prior_gate_yaw = 0.7;
 };
@@ -68,7 +80,9 @@ struct Args {
         << "  --consensus_xy M\n"
         << "  --consensus_yaw RAD\n"
         << "  --min_consensus_support N\n"
+        << "  --min_consensus_margin N\n"
         << "  --min_pairs N\n"
+        << "  --min_query_coverage V\n"
         << "  --min_overlap V\n"
         << "  --max_mean_residual M\n"
         << "  --max_max_residual M\n"
@@ -110,7 +124,13 @@ Args ParseArgs(int argc, char** argv) {
         else if (key == "--min_consensus_support") {
             args.min_consensus_support = std::stoi(need(key));
         }
+        else if (key == "--min_consensus_margin") {
+            args.min_consensus_margin = std::stoi(need(key));
+        }
         else if (key == "--min_pairs") args.min_pairs = std::stoi(need(key));
+        else if (key == "--min_query_coverage") {
+            args.min_query_coverage = std::stod(need(key));
+        }
         else if (key == "--min_overlap") args.min_overlap = std::stod(need(key));
         else if (key == "--max_mean_residual") args.max_mean_residual = std::stod(need(key));
         else if (key == "--max_max_residual") args.max_max_residual = std::stod(need(key));
@@ -136,6 +156,9 @@ Args ParseArgs(int argc, char** argv) {
     }
     if (args.min_consensus_support <= 0) {
         throw std::runtime_error("--min_consensus_support must be positive");
+    }
+    if (args.min_consensus_margin < 0) {
+        throw std::runtime_error("--min_consensus_margin must be non-negative");
     }
     return args;
 }
@@ -182,7 +205,9 @@ PoseSummary SummarizePose(const Eigen::Matrix4d& transform) {
 }
 
 double TreeRadius(const treelocpp::Tree& tree) {
-    return std::isfinite(tree.dbh) ? tree.dbh : tree.dbh_approximation;
+    return tree.dbh_valid && std::isfinite(tree.dbh)
+        ? tree.dbh
+        : std::numeric_limits<double>::quiet_NaN();
 }
 
 std::vector<size_t> CandidateSlots(const treelocpp::Dataset& database, const Args& args) {
@@ -378,6 +403,8 @@ struct HypothesisResult {
     bool valid = false;
     int pairs = 0;
     double overlap = 0.0;
+    double query_coverage = 0.0;
+    double candidate_coverage = 0.0;
     double mean_residual = std::numeric_limits<double>::quiet_NaN();
     double max_residual = std::numeric_limits<double>::quiet_NaN();
     double mean_dbh_difference = std::numeric_limits<double>::quiet_NaN();
@@ -418,10 +445,24 @@ HypothesisResult RefineHypothesis(const treelocpp::FrameData& query,
         );
     }
     out.pairs = static_cast<int>(pairs.size());
+
+    out.query_coverage = query.trees.empty()
+        ? 0.0
+        : static_cast<double>(pairs.size())
+            / static_cast<double>(query.trees.size());
+
+    out.candidate_coverage = candidate.trees.empty()
+        ? 0.0
+        : static_cast<double>(pairs.size())
+            / static_cast<double>(candidate.trees.size());
+
     const int uni = static_cast<int>(
         query.trees.size() + candidate.trees.size() - pairs.size()
     );
-    out.overlap = uni > 0 ? static_cast<double>(pairs.size()) / uni : 0.0;
+
+    out.overlap = uni > 0
+        ? static_cast<double>(pairs.size()) / uni
+        : 0.0;
     if (!pairs.empty()) {
         double residual_sum = 0.0;
         double residual_max = 0.0;
@@ -464,9 +505,22 @@ HypothesisResult RefineHypothesis(const treelocpp::FrameData& query,
 bool Better(const HypothesisResult& a, const HypothesisResult& b) {
     if (a.valid != b.valid) return a.valid;
     if (a.pairs != b.pairs) return a.pairs > b.pairs;
-    if (std::abs(a.overlap - b.overlap) > 1e-12) return a.overlap > b.overlap;
-    if (a.mean_residual != b.mean_residual) return a.mean_residual < b.mean_residual;
-    return a.max_residual < b.max_residual;
+
+    // For equal pair counts, geometric accuracy is more important than
+    // symmetric IoU. IoU otherwise favors sparse database frames.
+    if (a.mean_residual != b.mean_residual) {
+        return a.mean_residual < b.mean_residual;
+    }
+
+    if (a.max_residual != b.max_residual) {
+        return a.max_residual < b.max_residual;
+    }
+
+    if (std::abs(a.query_coverage - b.query_coverage) > 1e-12) {
+        return a.query_coverage > b.query_coverage;
+    }
+
+    return a.overlap > b.overlap;
 }
 
 struct Row {
@@ -489,11 +543,16 @@ void ApplyGate(Row& row, const Args& args) {
     const auto& h = row.selected;
     if (!h.valid) row.reject_reason = "hypothesis_not_valid";
     else if (h.pairs < args.min_pairs) row.reject_reason = "few_pairs";
-    else if (h.overlap < args.min_overlap) row.reject_reason = "low_overlap";
-    else if (!std::isfinite(h.mean_residual) || h.mean_residual > args.max_mean_residual) {
+    else if (h.query_coverage < args.min_query_coverage) {
+        row.reject_reason = "low_query_coverage";
+    } else if (!std::isfinite(h.mean_residual)
+               || h.mean_residual > args.max_mean_residual) {
         row.reject_reason = "high_mean_residual";
-    } else if (!std::isfinite(h.max_residual) || h.max_residual > args.max_max_residual) {
+    } else if (!std::isfinite(h.max_residual)
+               || h.max_residual > args.max_max_residual) {
         row.reject_reason = "high_max_residual";
+    } else if (h.overlap < args.min_overlap) {
+        row.reject_reason = "low_overlap";
     } else if (h.prior_err_xy > args.prior_gate_xy) row.reject_reason = "bad_prior_xy";
     else if (h.prior_err_yaw > args.prior_gate_yaw) row.reject_reason = "bad_prior_yaw";
     else {
@@ -505,11 +564,12 @@ void ApplyGate(Row& row, const Args& args) {
 bool PassesIntrinsicQuality(const HypothesisResult& hypothesis, const Args& args) {
     return hypothesis.valid
         && hypothesis.pairs >= args.min_pairs
-        && hypothesis.overlap >= args.min_overlap
+        && hypothesis.query_coverage >= args.min_query_coverage
         && std::isfinite(hypothesis.mean_residual)
         && hypothesis.mean_residual <= args.max_mean_residual
         && std::isfinite(hypothesis.max_residual)
-        && hypothesis.max_residual <= args.max_max_residual;
+        && hypothesis.max_residual <= args.max_max_residual
+        && hypothesis.overlap >= args.min_overlap;
 }
 
 double Median(std::vector<double> values) {
@@ -522,7 +582,9 @@ double Median(std::vector<double> values) {
 
 struct ConsensusResult {
     bool ok = false;
+    bool ambiguous = false;
     int support = 0;
+    int runner_up_support = 0;
     int representative_db_idx = -1;
     std::vector<int> member_db_indices;
     Eigen::Matrix4d T_map_query = Eigen::Matrix4d::Identity();
@@ -565,6 +627,20 @@ ConsensusResult BuildTriangleConsensus(std::vector<Row>& rows, const Args& args)
     const double center_yaw = YawFromMatrix(
         rows[best_index].triangle.T_map_query.block<3, 3>(0, 0)
     );
+    for (int i : eligible) {
+        const Eigen::Vector3d p =
+            rows[i].triangle.T_map_query.block<3, 1>(0, 3);
+        const double yaw = YawFromMatrix(
+            rows[i].triangle.T_map_query.block<3, 3>(0, 0)
+        );
+        const double xy = std::hypot(center.x() - p.x(), center.y() - p.y());
+        const double dyaw = std::abs(treelocpp::WrapAngle(center_yaw - yaw));
+        if (xy <= args.consensus_xy && dyaw <= args.consensus_yaw) continue;
+        result.runner_up_support = std::max(
+            result.runner_up_support,
+            rows[i].triangle_consensus_support
+        );
+    }
     std::vector<double> xs;
     std::vector<double> ys;
     std::vector<double> zs;
@@ -587,7 +663,11 @@ ConsensusResult BuildTriangleConsensus(std::vector<Row>& rows, const Args& args)
     }
     result.support = static_cast<int>(result.member_db_indices.size());
     result.representative_db_idx = rows[best_index].db_idx;
-    result.ok = result.support >= args.min_consensus_support;
+    result.ambiguous =
+        result.support - result.runner_up_support < args.min_consensus_margin;
+    result.ok =
+        result.support >= args.min_consensus_support
+        && !result.ambiguous;
     if (result.support == 0) return result;
     const double yaw = std::atan2(sin_sum, cos_sum);
     result.T_map_query = PoseFromXYYaw(
@@ -672,7 +752,12 @@ int main(int argc, char** argv) {
             ApplyGate(row, args);
             rows.push_back(std::move(row));
         }
-        const ConsensusResult consensus = BuildTriangleConsensus(rows, args);
+        ConsensusResult consensus = BuildTriangleConsensus(rows, args);
+        if (consensus.support > 0) {
+            // TreeLoc++ supplies only x/y/yaw. Height remains the external
+            // prior (normally LIO/IMU), and roll/pitch are never estimated.
+            consensus.T_map_query(2, 3) = args.prior_z;
+        }
         const auto is_consensus_member = [&](const Row& row) {
             return std::find(
                 consensus.member_db_indices.begin(),
@@ -704,10 +789,25 @@ int main(int argc, char** argv) {
             }
         );
         const Eigen::Matrix4d T_odom_query = treelocpp::PoseToTransform(query.pose);
+        const double odom_query_yaw = YawFromMatrix(
+            T_odom_query.block<3, 3>(0, 0)
+        );
+        const Eigen::Matrix4d T_odom_query_planar = PoseFromXYYaw(
+            query.pose.x, query.pose.y, 0.0, odom_query_yaw
+        );
+        const Eigen::Matrix4d T_map_prior_planar = PoseFromXYYaw(
+            args.prior_x, args.prior_y, 0.0, args.prior_yaw
+        );
+        const Eigen::Matrix4d T_map_query_planar = PoseFromXYYaw(
+            consensus.T_map_query(0, 3),
+            consensus.T_map_query(1, 3),
+            0.0,
+            YawFromMatrix(consensus.T_map_query.block<3, 3>(0, 0))
+        );
         const Eigen::Matrix4d T_map_odom_prior =
-            T_map_prior * T_odom_query.inverse();
+            T_map_prior_planar * T_odom_query_planar.inverse();
         const Eigen::Matrix4d T_map_odom_candidate =
-            consensus.T_map_query * T_odom_query.inverse();
+            T_map_query_planar * T_odom_query_planar.inverse();
         const Eigen::Matrix4d T_difference =
             T_map_odom_candidate * T_map_odom_prior.inverse();
         const PoseSummary map_query_summary = SummarizePose(consensus.T_map_query);
@@ -735,6 +835,8 @@ int main(int argc, char** argv) {
         );
         std::cout << "triangle_consensus_ok=" << (consensus.ok ? 1 : 0)
                   << " support=" << consensus.support
+                  << " runner_up_support=" << consensus.runner_up_support
+                  << " ambiguous=" << (consensus.ambiguous ? 1 : 0)
                   << " representative_db_idx=" << consensus.representative_db_idx
                   << " est_x=" << consensus_position.x()
                   << " est_y=" << consensus_position.y()
@@ -762,6 +864,8 @@ int main(int argc, char** argv) {
             << " map_idx="
             << (localization_ok ? consensus.representative_db_idx : -1)
             << " support=" << consensus.support
+            << " runner_up_support=" << consensus.runner_up_support
+            << " ambiguous=" << (consensus.ambiguous ? 1 : 0)
             << " pairs="
             << (representative_hypothesis ? representative_hypothesis->pairs : 0)
             << " overlap="
@@ -813,7 +917,8 @@ int main(int argc, char** argv) {
             << "triangle_hypotheses triangle_pairs triangle_mean_residual "
             << "triangle_consensus_support "
             << "pairs overlap mean_residual max_residual mean_dbh_diff "
-            << "est_x est_y est_z est_yaw prior_err_xy prior_err_yaw\n";
+            << "est_x est_y est_z est_yaw prior_err_xy prior_err_yaw "
+            << "query_coverage candidate_coverage\n";
         const int count = std::min(args.top_k, static_cast<int>(rows.size()));
         for (int i = 0; i < count; ++i) {
             const auto& row = rows[i];
@@ -836,7 +941,9 @@ int main(int argc, char** argv) {
                       << h.mean_residual << ' ' << h.max_residual << ' '
                       << h.mean_dbh_difference << ' '
                       << p.x() << ' ' << p.y() << ' ' << p.z() << ' ' << yaw << ' '
-                      << h.prior_err_xy << ' ' << h.prior_err_yaw << '\n';
+                      << h.prior_err_xy << ' ' << h.prior_err_yaw << ' '
+                      << h.query_coverage << ' '
+                      << h.candidate_coverage << '\n';
         }
         return 0;
     } catch (const std::exception& e) {

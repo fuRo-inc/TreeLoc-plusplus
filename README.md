@@ -1,215 +1,72 @@
-<div align="center">
+# Z-only ground alignment diagnostic
 
-<h1>TreeLoc++: Robust 6-DoF LiDAR Localization in Forests</h1>
+The package contains an offline diagnostic and a stateful preprocessing stage.
+The preprocessing stage is tree-independent: at each query it uses the current
+map-to-odom XY/yaw prior to select the nearest reference window, updates only Z,
+and then passes that state to TreeLoc++. TreeLoc++ continues to estimate only
+XY/yaw.
 
-Official repository for **TreeLoc++**.
+The reference payload is selected from the accepted row's `map_index`. Ground
+points are extracted independently in each payload, so an initial vertical
+offset does not remove the true terrain before optimization. Matching uses one
+robust terrain sample per shared global XY cell. This prevents vegetation
+outliers and dense current payloads from creating thousands of many-to-one
+nearest-neighbor votes. Gates use the same trimmed residual population as the
+robust optimizer rather than returning rejected outliers to the full RMSE.
 
-<a href="https://github.com/minwoo0611/TreeLoc" target="_blank">Previous version (TreeLoc)</a> |
-<a href="https://drive.google.com/drive/folders/1O0d3Xg3oDdF0GC7BhcHZsiglNQmsUBNn?usp=sharing" target="_blank">Dataset</a>
-
-</div>
-
-### Recent Updates
-- [2026/06/27] Added public dataset release details and multi-session pose graph optimization code.
-- [2026/06/25] Initial TreeLoc++ branch with intra-session and inter-session C++ code.
-
-### Contributions
-- **TreeLoc++ performs forest localization on compact Digital Forest Inventories (DFIs)**, representing tree stems with geometric attributes rather than dense point-cloud maps.
-- **TreeLoc++ improves retrieval in structurally ambiguous forests** by combining TDH retrieval with PDH tree-layout context, triangle verification, DBH consistency, and yaw-consistent inlier selection.
-- **TreeLoc++ estimates full 6-DoF corrections from tree geometry** by jointly refining height, roll, and pitch after geometric matching.
-- **TreeLoc++ supports long-term and multi-session evaluation** across repeated forest traversals using the same tree-level map interface.
-
-### Data Source and Tree Extraction
-
-TreeLoc++ consumes tree-level observations extracted before evaluation. The repository includes two Wild-Places Venman sample sequences, while the full processed Oxford and Wild-Places release is distributed separately through [Google Drive](https://drive.google.com/drive/folders/1O0d3Xg3oDdF0GC7BhcHZsiglNQmsUBNn?usp=sharing). Following TreeLoc, tree observations can be produced with [RealtimeTrees](https://github.com/ori-drs/realtime_trees) from the corresponding forest LiDAR recordings.
-
-The bundled sample datasets correspond to:
-
-- `Wild_V03` and `Wild_V04`: Wild-Places Venman sequences. The raw dataset is available from the [Wild-Places project page](https://csiro-robotics.github.io/Wild-Places/) and [CSIRO Data Access Portal](https://data.csiro.au/collection/csiro%3A56372).
-
-The full public release also includes Oxford Evo, Stein am Rein, Forest of Dean, Wytham, and multi-session Evo23/Evo25 sequences. The single-session Oxford raw recordings are available from the [Oxford Forest Place Recognition Dataset](https://dynamic.robots.ox.ac.uk/datasets/oxford-forest/).
-
-The evaluator expects a processed dataset root:
-
-```text
-dataset_root/
-├── trajectory.txt
-├── TreeManagerState_0.csv
-├── TreeManagerState_1.csv
-└── ...
-```
-
-`trajectory.txt` uses:
-
-```text
-timestamp x y z qx qy qz qw
-```
-
-Each `TreeManagerState_<idx>.csv` must include:
-
-- `axis_00` ... `axis_22`
-- `location_x`, `location_y`, `location_z`
-- `dbh` or `dbh_approximation`
-
-Optional columns used when available:
-
-- `reconstructed`
-- `number_clusters`
-- `score` or `scores`
-
-### Public Dataset Download
-
-The public processed TreeLoc++ dataset is available on [Google Drive](https://drive.google.com/drive/folders/1O0d3Xg3oDdF0GC7BhcHZsiglNQmsUBNn?usp=sharing). It is organized as:
-
-```text
-TreeLoc++_Dataset/
-├── Oxford/
-│   ├── Evo/
-│   ├── Stein am Rein/
-│   ├── Forest of Dean/
-│   ├── Wytham/
-│   ├── Evo23_00/ ... Evo23_05/
-│   └── Evo25_00/ ... Evo25_08/
-└── Wild-Places/
-    ├── V-01/ ... V-04/
-    └── K-01/ ... K-04/
-```
-
-Each sequence folder contains:
-
-- `PCD_downsampled_0.1.zip`: downsampled LiDAR frames under `downsampled_0.1/`.
-- `tree_information.zip`: per-frame tree-level CSV files.
-
-Single-session sequences also provide `groundtruth.txt`. Multi-session Evo23/Evo25 sequences provide `initial_slam_results.csv` and `optimized.txt` for SLAM initialization and optimized trajectory references.
-
-The sample datasets kept under `data/` are enough to run intra-session, inter-session, pose-edge export, and graph-optimization input generation without downloading the full release. Use the Google Drive dataset for the full Oxford and Wild-Places release.
-
-### Prerequisites
-
-TreeLoc++ is a C++17 CMake project.
-
-- CMake >= 3.16
-- C++17 compiler
-- Eigen3
-
-Ubuntu:
+## Install and test
 
 ```bash
-sudo apt update
-sudo apt install build-essential cmake libeigen3-dev
+tar -xf ~/Downloads/TreeLoc-plusplus-z-only-ground-alignment.tar \
+  -C ~/TreeLoc-plusplus
+
+cd ~/TreeLoc-plusplus
+python3 tests/test_z_only_ground_alignment.py
 ```
 
-### Build
+## Run the 42 accepted-query diagnostic
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
+SE2_RESULT=\
+/home/wataru/TreeLoc-plusplus/results/asaka_forest_4_localization_new_partial_se2_reacquire_v1
+
+REFERENCE_WINDOWS=\
+/home/wataru/realtime_trees_cpp_ref/data/asaka_forest_4_map_windowed_a2_r20_v005_v1
+
+CURRENT_WINDOWS=\
+/home/wataru/realtime_trees_cpp_ref/data/asaka_forest_localization_new_current_windowed_a2_r20_v005_v1
+
+python3 tools/analyze_z_only_ground_alignment.py \
+  --replay-csv "$SE2_RESULT/temporal_replay.csv" \
+  --reference-window-root "$REFERENCE_WINDOWS" \
+  --current-window-root "$CURRENT_WINDOWS" \
+  --output-dir "$SE2_RESULT/z_only_ground_v1"
 ```
 
-This builds:
+The result is `z_only_ground_alignment.csv`. `state_z_candidate` is
+`state_z_before + dz`; only rows with `valid=1` should be considered. Before
+online integration, inspect the valid count, the median/MAD of candidate Z,
+and discontinuities over query index.
 
-- `treelocpp_intra`
-- `treelocpp_inter`
-- `treelocpp_graph_opt` when GTSAM is available
+## Pre-TreeLoc integration
 
-### Usage
+`z_only_ground_preprocessor.py` exposes `GroundZPreprocessor.update(query,
+state)`. The returned transform is a copy with only element `[2, 3]` changed.
+It does not read trees or TreeLoc++ decisions. The v4 replay calls this method
+before `run_localizer()` for every query and writes independent diagnostics to
+`ground_z_preprocessor.csv`.
 
-The repository keeps two processed Wild-Places sample datasets under `data/`:
-
-```text
-data/Wild_V03/
-data/Wild_V04/
-```
-
-#### Intra-Session Localization
+Compared with the v3 replay command, use
+`visualize_temporal_map_odom_replay_rank_fallback_v4.py` and add:
 
 ```bash
-./build/treelocpp_intra config/full_v03.yaml
-./build/treelocpp_intra config/full_v04.yaml
+  --z-reference-window-root "$REFERENCE_WINDOWS" \
+  --z-current-window-root "$CURRENT_WINDOWS" \
+  --z-temporal-window 8 \
+  --z-temporal-tolerance 0.25 \
+  --z-min-temporal-support 3 \
+  --z-max-update 0.15
 ```
 
-#### Inter-Session Localization
-
-```bash
-./build/treelocpp_inter config/inter_v03_v04.yaml
-```
-
-`config/inter_v03_v04.yaml` uses the Wild_V test-region family selected by `test_region_family` and a 5 m ground-truth radius.
-
-Both intra-session and inter-session evaluators print:
-
-- `Recall@1`, `MR`, `MF1`, and `AUC` for retrieval.
-- `R@50`, `SR`, `ATE`, and `ARE` for 2D pose estimates.
-- `R@50`, `SR`, `ATE`, and `ARE` for 3D pose estimates.
-
-`R@50` and `SR` use `evaluation.localization_translation_threshold_m` and `evaluation.localization_rotation_threshold_deg`, which default to 0.5 m and 5 deg. `SR` is the true-pair success rate, `ATE` is translation error, and `ARE` is rotation error.
-
-#### Pose-Edge Export
-
-Set `pose_edges.enabled: true` in a config file to export GTSAM-compatible pose edges:
-
-```text
-q_idx db_idx overlap x y z roll pitch yaw
-```
-
-Pose-edge files are whitespace-delimited text files named `pose_<map_label>_vs_<query_label>.txt`, for example `pose_V04_vs_V03.txt`. Each row stores one relative pose from query frame `q_idx` to map frame `db_idx`; translation is in meters and roll, pitch, and yaw are in radians.
-
-Inter-session configs can also provide comma-separated `dataset.query_roots`, `dataset.map_roots`, `dataset.query_labels`, and `dataset.map_labels` for multi-session batch export. If ground-truth trajectory information is unavailable, evaluation metrics are skipped, but pose-edge export still writes ranked pairs when `pose_edges.enabled` is true.
-
-#### Graph Optimization
-
-When GTSAM is installed, run:
-
-```bash
-./build/treelocpp_graph_opt sessions.csv results/pose_edges results/optimized
-```
-
-The optimizer loads one SLAM trajectory per session from `sessions.csv`, adds TreeLoc++ pose-edge files from the pose-edge directory as cross-session constraints, and writes optimized trajectories to the output directory.
-
-Each row in `sessions.csv` defines one session:
-
-```text
-label,slam_csv
-label,key,slam_csv
-```
-
-Use `label,slam_csv` for the default case. Use `label,key,slam_csv` only when you need to choose the one-character GTSAM symbol key explicitly.
-
-Example:
-
-```csv
-V03,data/Wild_V03/trajectory.txt
-V04,data/Wild_V04/trajectory.txt
-```
-
-With the two-column format above, the graph optimizer uses `V03` and `V04` as session labels and assigns GTSAM keys automatically. It scans the pose-edge directory for files whose names use those labels:
-
-```text
-pose_V04_vs_V03.txt
-pose_V03_vs_V04.txt
-```
-
-If both directions are present, both files are loaded as cross-session constraints. A filename such as `V03_vs_V04.txt` is not loaded because the expected prefix is `pose_`.
-
-Use the three-column format when you want explicit GTSAM symbol keys:
-
-```csv
-V03,A,data/Wild_V03/trajectory.txt
-V04,B,data/Wild_V04/trajectory.txt
-```
-
-Here, `V03` and `V04` are still the labels used in pose-edge filenames, while `A` and `B` are the one-character keys used inside the GTSAM graph.
-
-### Configuration
-
-Main parameters are grouped by role in:
-
-- `config/full_v03.yaml` for full Wild_V03 intra-session evaluation
-- `config/full_v04.yaml` for full Wild_V04 intra-session evaluation
-- `config/inter_v03_v04.yaml` for full Wild_V03-to-Wild_V04 inter-session evaluation
-
-Each YAML file includes inline comments for the exposed parameters.
-
-### Acknowledgement
-
-TreeLoc++ builds on [TreeLoc](https://arxiv.org/abs/2602.01501), tree-level representations extracted with [RealtimeTrees](https://github.com/ori-drs/realtime_trees), and forest LiDAR recordings from the [Wild-Places](https://csiro-robotics.github.io/Wild-Places/) and [Oxford Forest Place Recognition](https://dynamic.robots.ox.ac.uk/datasets/oxford-forest/) datasets.
+The Z stage holds its state on missing files, bad residuals, insufficient
+temporal support, or exceptions; those failures do not abort TreeLoc++.

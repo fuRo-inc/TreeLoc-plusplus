@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -30,8 +31,12 @@ struct Tree {
     double x = 0.0;
     double y = 0.0;
     double z = 0.0;
-    double dbh = 0.0;
-    double dbh_approximation = 0.0;
+    // A measured/reconstructed DBH may be used for DBH-aware matching only
+    // when dbh_valid is true. dbh_approximation is weaker candidate metadata
+    // (for example, an axis diameter) and must not silently become a DBH.
+    double dbh = std::numeric_limits<double>::quiet_NaN();
+    bool dbh_valid = false;
+    double dbh_approximation = std::numeric_limits<double>::quiet_NaN();
     double score = 1.0;
     int reconstructed = 1;
     int number_clusters = 3;

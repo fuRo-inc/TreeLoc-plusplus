@@ -21,7 +21,8 @@ TREE_COLUMNS = [
     "axis_10", "axis_11", "axis_12",
     "axis_20", "axis_21", "axis_22",
     "location_x", "location_y", "location_z",
-    "dbh_approximation", "reconstructed", "number_clusters",
+    "dbh", "dbh_valid", "dbh_approximation",
+    "reconstructed", "number_clusters",
     "score", "payload_index", "tree_id",
 ]
 
@@ -46,7 +47,7 @@ def write_trajectory(path, poses):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_trees(path, trees, payload_index):
+def write_trees(path, trees, payload_index, partial=False):
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=TREE_COLUMNS)
         writer.writeheader()
@@ -56,8 +57,12 @@ def write_trees(path, trees, payload_index):
                 "axis_10": 0.0, "axis_11": 1.0, "axis_12": 0.0,
                 "axis_20": 0.0, "axis_21": 0.0, "axis_22": 1.0,
                 "location_x": x, "location_y": y, "location_z": 0.0,
-                "dbh_approximation": dbh,
-                "reconstructed": 1,
+                # Partial candidates deliberately carry no usable diameter.
+                # Their XY constellation must still be loadable/localizable.
+                "dbh": "" if partial else dbh,
+                "dbh_valid": 0 if partial else 1,
+                "dbh_approximation": "" if partial else dbh,
+                "reconstructed": 0 if partial else 1,
                 "number_clusters": 1,
                 "score": 1.0,
                 "payload_index": payload_index,
@@ -76,17 +81,24 @@ def parse_result(output):
     }
 
 
-def run(executable, config, query_root, database_root, min_support):
+def run(
+    executable,
+    config,
+    query_root,
+    database_root,
+    min_support,
+    search_radius=4.0,
+):
     command = [
         str(executable), str(config),
         "--query_root", str(query_root),
         "--database_root", str(database_root),
         "--prior_x", "3.0",
         "--prior_y", "-1.5",
-        "--prior_z", "0.0",
+        "--prior_z", "4.25",
         "--prior_yaw", str(math.radians(20.0)),
-        "--search_radius", "10.0",
-        "--top_k", "3",
+        "--search_radius", str(search_radius),
+        "--top_k", "6",
         "--min_consensus_support", str(min_support),
     ]
     completed = subprocess.run(
@@ -131,19 +143,24 @@ def main():
 
         write_trajectory(
             query_root / "trajectory.txt",
-            [(odom_c_x, odom_c_y, 0.0, odom_c_yaw)],
+            [(odom_c_x, odom_c_y, 2.0, odom_c_yaw)],
         )
         write_trees(
             query_root / "TreeManagerState_0.csv",
             query_trees,
             0,
+            partial=True,
         )
 
+        database_poses = (
+            [(0.0, 0.0, 0.0, 0.0)] * 3
+            + [(10.0, 0.0, 0.0, math.pi)] * 3
+        )
         write_trajectory(
             database_root / "trajectory.txt",
-            [(0.0, 0.0, 0.0, 0.0)] * 3,
+            database_poses,
         )
-        for index in range(3):
+        for index in range(6):
             write_trees(
                 database_root / f"TreeManagerState_{index}.csv",
                 DATABASE_TREES,
@@ -170,12 +187,18 @@ def main():
 
         assert_close(float(accepted["map_c_x"]), map_c_x)
         assert_close(float(accepted["map_c_y"]), map_c_y)
+        assert_close(float(accepted["map_c_z"]), 4.25)
+        assert_close(float(accepted["map_c_roll"]), 0.0)
+        assert_close(float(accepted["map_c_pitch"]), 0.0)
         assert_close(float(accepted["map_c_yaw"]), map_c_yaw)
         assert_close(float(accepted["odom_c_x"]), odom_c_x)
         assert_close(float(accepted["odom_c_y"]), odom_c_y)
         assert_close(float(accepted["odom_c_yaw"]), odom_c_yaw)
         assert_close(float(accepted["map_odom_x"]), expected_x)
         assert_close(float(accepted["map_odom_y"]), expected_y)
+        assert_close(float(accepted["map_odom_z"]), 0.0)
+        assert_close(float(accepted["map_odom_roll"]), 0.0)
+        assert_close(float(accepted["map_odom_pitch"]), 0.0)
         assert_close(float(accepted["map_odom_yaw"]), expected_yaw)
 
         rejected = run(
@@ -194,6 +217,29 @@ def main():
         ):
             if not math.isnan(float(rejected[key])):
                 raise AssertionError(f"{key} must be nan: {rejected[key]}")
+
+        ambiguous = run(
+            args.executable,
+            args.config,
+            query_root,
+            database_root,
+            3,
+            search_radius=20.0,
+        )
+        if (
+            ambiguous["ok"] != "0"
+            or ambiguous["map_idx"] != "-1"
+            or ambiguous["support"] != "3"
+            or ambiguous["runner_up_support"] != "3"
+            or ambiguous["ambiguous"] != "1"
+        ):
+            raise AssertionError(ambiguous)
+        for key in (
+            "map_c_x", "map_c_y", "map_c_yaw",
+            "map_odom_x", "map_odom_y", "map_odom_yaw",
+        ):
+            if not math.isnan(float(ambiguous[key])):
+                raise AssertionError(f"{key} must be nan: {ambiguous[key]}")
 
 
 if __name__ == "__main__":

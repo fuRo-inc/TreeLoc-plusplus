@@ -134,15 +134,28 @@ std::vector<Tree> ReadTreeCsv(const std::filesystem::path& path) {
         tree.dbh = ToDouble(Cell(cells, columns, "dbh"), std::numeric_limits<double>::quiet_NaN());
         tree.dbh_approximation =
             ToDouble(Cell(cells, columns, "dbh_approximation"), std::numeric_limits<double>::quiet_NaN());
-        if (!std::isfinite(tree.dbh) && std::isfinite(tree.dbh_approximation)) tree.dbh = tree.dbh_approximation;
+
+        const bool has_explicit_dbh_valid = columns.count("dbh_valid") != 0;
+        if (has_explicit_dbh_valid) {
+            tree.dbh_valid = ToInt(Cell(cells, columns, "dbh_valid"), 0) != 0;
+        } else {
+            // Legacy TreeManagerState files exposed only dbh_approximation and
+            // historically used it as DBH. Preserve that behavior only when
+            // the new validity column is absent.
+            if (!std::isfinite(tree.dbh) && std::isfinite(tree.dbh_approximation)) {
+                tree.dbh = tree.dbh_approximation;
+            }
+            tree.dbh_valid = std::isfinite(tree.dbh);
+        }
         if (!std::isfinite(tree.dbh_approximation) && std::isfinite(tree.dbh)) tree.dbh_approximation = tree.dbh;
+        if (!std::isfinite(tree.dbh)) tree.dbh_valid = false;
         tree.score = ToDouble(Cell(cells, columns, "score"),
                               ToDouble(Cell(cells, columns, "scores"), 1.0));
         tree.reconstructed = ToInt(Cell(cells, columns, "reconstructed"), 1);
         tree.number_clusters = ToInt(Cell(cells, columns, "number_clusters"), 3);
-        if (std::isfinite(tree.dbh)) {
-            trees.push_back(tree);
-        }
+        // XY geometry is sufficient for the partial-tree SE(2) path. DBH is
+        // optional metadata and must not decide whether a candidate exists.
+        trees.push_back(tree);
     }
     return trees;
 }

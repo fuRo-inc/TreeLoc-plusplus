@@ -26,7 +26,9 @@ constexpr std::array<std::array<int, 3>, 6> kPerms{{
 constexpr double kPdhWeight = 0.5;
 
 double TreeRadius(const Tree& tree) {
-    return std::isfinite(tree.dbh) ? tree.dbh : tree.dbh_approximation;
+    return tree.dbh_valid && std::isfinite(tree.dbh)
+        ? tree.dbh
+        : std::numeric_limits<double>::quiet_NaN();
 }
 
 Eigen::Matrix3d ProjectSO3(const Eigen::Matrix3d& R) {
@@ -328,8 +330,15 @@ std::vector<MatchPair> NearestMatches(const FrameData& qf,
         const Eigen::Vector2d cp(cf.trees[ci].x, cf.trees[ci].y);
         for (int qi = 0; qi < static_cast<int>(qf.trees.size()); ++qi) {
             if (q_used[qi]) continue;
-            const double dr = std::abs(TreeRadius(qf.trees[qi]) - TreeRadius(cf.trees[ci]));
-            if (dr >= std::max(0.4, config.dbh_diff_tol * 2.0)) continue;
+            if (config.use_dbh_triangle_match) {
+                const double q_dbh = TreeRadius(qf.trees[qi]);
+                const double c_dbh = TreeRadius(cf.trees[ci]);
+                if (std::isfinite(q_dbh) && std::isfinite(c_dbh) &&
+                    std::abs(q_dbh - c_dbh) >=
+                        std::max(0.4, config.dbh_diff_tol * 2.0)) {
+                    continue;
+                }
+            }
             const Eigen::Vector2d qp = R * Eigen::Vector2d(qf.trees[qi].x, qf.trees[qi].y) + t;
             const double d2 = (qp - cp).squaredNorm();
             if (d2 < best_d2) {
