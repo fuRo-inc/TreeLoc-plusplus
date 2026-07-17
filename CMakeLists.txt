@@ -31,6 +31,13 @@ target_include_directories(
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 add_library(TreeLocPP::treelocpp ALIAS treelocpp)
+
+set_target_properties(
+    treelocpp
+    PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+)
+
 target_link_libraries(treelocpp PUBLIC Eigen3::Eigen)
 
 add_executable(treelocpp_intra apps/intra.cpp)
