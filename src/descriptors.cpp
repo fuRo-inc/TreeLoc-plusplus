@@ -184,6 +184,14 @@ FrameData BuildFrame(const std::filesystem::path& root,
     }
 
     std::vector<Tree> raw = ReadTreeCsv(root / ("TreeManagerState_" + std::to_string(idx) + ".csv"));
+
+    // The runtime pipeline supplies an already aggregated tree window in
+    // memory. When file-based neighbor augmentation is disabled, keep the
+    // offline and runtime paths identical by using the public memory API.
+    if (!config.neighbor_augment) {
+        return BuildFrameData(idx, frame.pose, raw, config);
+    }
+
     std::vector<Tree> current;
     current.reserve(raw.size());
     for (const auto& tree : raw) {
@@ -342,6 +350,97 @@ std::vector<Tree> SelectTrees(const std::vector<Tree>& trees, const Config& conf
         }
     }
     return selected;
+}
+
+FrameData BuildFrameData(int frame_index,
+                         const Pose& pose,
+                         const std::vector<Tree>& trees,
+                         const Config& config) {
+    FrameData frame;
+    frame.index = frame_index;
+    frame.pose = pose;
+
+    std::vector<Tree> current;
+    current.reserve(trees.size());
+    for (const auto& tree : trees) {
+        if (InLocalBox(tree, config)) current.push_back(tree);
+    }
+
+    std::vector<Tree> reconstructed;
+    std::vector<Tree> supplemental;
+    std::vector<Tree> supplemental_gt2;
+    std::vector<Tree> supplemental_eq2;
+    std::vector<Tree> supplemental_other;
+    for (const auto& tree : current) {
+        if (tree.reconstructed == 1) {
+            reconstructed.push_back(tree);
+        } else if (tree.score > config.tree_score_min) {
+            supplemental.push_back(tree);
+            if (tree.number_clusters > 2) {
+                supplemental_gt2.push_back(tree);
+            } else if (tree.number_clusters == 2) {
+                supplemental_eq2.push_back(tree);
+            } else {
+                supplemental_other.push_back(tree);
+            }
+        }
+    }
+
+    frame.trees = reconstructed;
+    SortByScoreDesc(supplemental_gt2);
+    AppendNonDuplicatesUntil(frame.trees, supplemental_gt2,
+                             config.dedup_distance, config.number_of_cluster);
+    if (static_cast<int>(frame.trees.size()) < config.number_of_cluster) {
+        SortByScoreDesc(supplemental_eq2);
+        AppendNonDuplicatesUntil(frame.trees, supplemental_eq2,
+                                 config.dedup_distance, config.number_of_cluster);
+    }
+    if (static_cast<int>(frame.trees.size()) < config.number_of_cluster) {
+        SortByScoreDesc(supplemental_other);
+        AppendNonDuplicatesUntil(frame.trees, supplemental_other,
+                                 config.dedup_distance, config.number_of_cluster);
+    }
+
+    if (frame.trees.empty()) {
+        SortByScoreDesc(supplemental);
+        const int count = std::min(config.number_of_cluster,
+                                   static_cast<int>(supplemental.size()));
+        frame.trees.insert(frame.trees.end(),
+                           supplemental.begin(),
+                           supplemental.begin() + count);
+    }
+
+    frame.alignment_transform =
+        ApplyFrameAlignment(frame.trees, current, config);
+
+    frame.centers.reserve(frame.trees.size());
+    for (const auto& tree : frame.trees) {
+        frame.centers.emplace_back(tree.x, tree.y);
+    }
+
+    const std::vector<RangeBin> radius_bins = BuildRadiusBins(config);
+    std::vector<Tree> reconstructed_only;
+    for (const auto& tree : frame.trees) {
+        if (tree.reconstructed == 1) reconstructed_only.push_back(tree);
+    }
+
+    const std::vector<Tree>& tdh_trees =
+        config.tdh_use_rec_only ? reconstructed_only : frame.trees;
+    const std::vector<Tree>& pdh_trees =
+        config.pdh_use_rec_only ? reconstructed_only : frame.trees;
+
+    frame.tdh =
+        ComputeTDH(tdh_trees, config.spatial_range_bins, radius_bins);
+    frame.pdh = ComputePDH(pdh_trees, config);
+    frame.triangles = ComputeKnnTriangles(
+        frame.centers, config.knn_k, config.min_dist, config.max_dist);
+    frame.hashes = TriangleHashes(
+        frame.triangles, frame.centers,
+        config.delta_l, config.rho, config.hash_modulus);
+    for (const auto& item : frame.hashes) {
+        ++frame.hash_counts[item.first];
+    }
+    return frame;
 }
 
 Eigen::MatrixXd ComputeTDH(const std::vector<Tree>& trees,
