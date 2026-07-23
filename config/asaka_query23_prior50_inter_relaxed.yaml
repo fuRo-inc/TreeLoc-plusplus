@@ -1,0 +1,76 @@
+dataset:
+  mode: intra
+  root: data/asaka_query23_prior50_merged
+  frame_limit: 0
+evaluation:
+  gt_radius_m: 5.0
+  localization_translation_threshold_m: 2.0
+  localization_rotation_threshold_deg: 15.0
+  intra_exclusion_frames: 0
+retrieval:
+  recall_at_k: 1
+  tdh_top_k: 34
+  hash_rerank_top_k: 34
+tree_selection:
+  target_tree_count: 30
+  local_radius_m: 30.0
+  supplemental_score_min: 0.1
+  dedup_radius_m: 0.4
+neighbor_augmentation:
+  enabled: false
+  past_only: true
+  max_neighbor_frames: 5
+  search_radius_m: 5.0
+  min_reconstructed_trees: 15
+tdh:
+  use_reconstructed_only: false
+  dbh_min_m: 0.0
+  dbh_max_m: 0.8
+  dbh_sections: 8
+  dbh_bin_width_m: 0.15
+  spatial_bin_interval_m: 6.0
+  spatial_bin_padding_m: 1.0
+  spatial_bin_count: 5
+  spatial_min_m: 0.0
+  spatial_max_m: 30.0
+pdh:
+  use_reconstructed_only: true
+  min_distance_m: 0.0
+  max_distance_m: 10.0
+  bin_count: 40
+  max_sampled_pairs: 5000
+  soft_binning: false
+triangle_descriptor:
+  knn_neighbors: 15
+  min_edge_m: 0.5
+  max_edge_m: 30.0
+  edge_quantization_m: 0.5
+  hash_base: 100007
+  hash_modulus: 50000000
+translation_aware_overlap:
+  enabled: true
+  mode: exp
+  tau_m: 5.0
+  power: 2.0
+yaw_voting:
+  enabled: true
+  bin_deg: 5.0
+  inlier_tolerance_deg: 10.0
+  min_triangle_inliers: 1
+dbh_matching:
+  enabled: false
+  difference_tolerance_m: 0.4
+  refine_distance_tolerance_m: 0.8
+  match_distance_tolerance_m: 0.8
+pose_refinement:
+  enabled: false
+  ransac_iterations: 200
+  ransac_min_sample: 4
+  z_inlier_tolerance_m: 0.1
+  z_inlier_ratio: 0.5
+pose_edges:
+  enabled: true
+  output_dir: results/pose_edges_furo_relaxed
+  prefix: pose
+tree_axis_alignment:
+  enabled: false
